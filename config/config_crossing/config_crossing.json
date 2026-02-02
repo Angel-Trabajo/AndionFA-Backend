@@ -1,0 +1,42 @@
+{
+    "max_sri": 0.04,
+    "min_sri": 0.02,
+    "n_totales": 60,
+    "min_operaciones": 200.0,
+    "max_depth": "12",
+    "maximo_weka_tree": 500,
+    "intentos": 1,
+    "aumento_arboles": 300,
+    "aumento_profundidad": 12,
+    "list_symbols": [
+        "EURAUD",
+        "EURCAD",
+        "EURCHF",
+        "EURMXN",
+        "EURNOK",
+        "EURNZD",
+        "EURSEK",
+        "EURTRY",
+        "EURUSD",
+        "GBPAUD",
+        "GBPCAD",
+        "GBPCHF",
+        "GBPMXN",
+        "GBPNOK",
+        "GBPNZD",
+        "GBPSEK",
+        "GBPTRY",
+        "GBPUSD"
+    ],
+    "principal_symbol": "EURUSD",
+    "timeframe": "H1",
+    "por_direccion": true,
+    "list_symbols_inversos": [
+        "GBPAUD",
+        "GBPCAD",
+        "GBPCHF",
+        "GBPMXN",
+        "GBPNOK",
+        "GBPNZD"
+    ]
+}
