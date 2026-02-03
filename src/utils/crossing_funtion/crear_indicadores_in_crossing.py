@@ -6,11 +6,9 @@ import concurrent.futures
 import os
 import re
 from datetime import datetime
-import time as tim
-from src.routes import peticiones
 
 
-_mapping_time = peticiones.get_timeframes()
+
 
 replaceString = {
     "SMA": 0,
@@ -46,13 +44,6 @@ def extract_indicadores():
     end = f"{fechas[1][:4]}-{fechas[1][4:6]}-{fechas[1][6:]}"
     
     for sym in list_symbol:
-        # Crear directorios UNA sola vez
-        base_path = f'output/crossing_{principal_symbol}/{sym}'
-        os.makedirs(f'{base_path}/is_os', exist_ok=True)
-        os.makedirs(f'{base_path}/extrac', exist_ok=True)
-        os.makedirs(f'{base_path}/extrac_os', exist_ok=True)  
-        os.makedirs(f'{base_path}/data_arff', exist_ok=True) 
-        os.makedirs(f'output/db/crossing_{principal_symbol}_dbs', exist_ok=True)
         
         list_files = os.listdir(f'output/extrac')
         indicators_files = [file.split('_')[0]+'.csv' for file in list_files]
@@ -66,49 +57,24 @@ def extract_indicadores():
                                      str_start, end, indicators_files, 'extrac')
             concurrent.futures.wait([future1, future2])
 
+
 def create_files_fast(symbol, timeframe, str_start, end, indicators_files, folder):
-    """Versión ULTRA rápida de create_files"""
-    peticiones.initialize_mt5()
     
-    # Obtener datos UNA sola vez
-    df = None
-    for _ in range(3):  # 3 intentos máximo
-        try:
-            timeframe_mapped = _mapping_time.get(timeframe)
-            rates = peticiones.get_historical_data(symbol, timeframe_mapped, str_start, end)
-            df = pd.DataFrame(rates)
-            df["time"] = pd.to_datetime(df["time"], unit="s")
-            
-            # Guardar CSV inmediatamente
-            if folder == 'extrac':
-                df.to_csv(f'output/crossing_{principal_symbol}/{symbol}/is_os/is.csv', index=False)
-            else:
-                df.to_csv(f'output/crossing_{principal_symbol}/{symbol}/is_os/os.csv', index=False)
-            
-            start = datetime.strptime(str_start, '%Y-%m-%d')
-            pos, _ = _buscar_fecha_o_siguiente_fast(df, start)
-            if pos is not None:
-                break
-        except Exception as e:
-            print(f"Error MT5 {symbol}: {e}")
-            tim.sleep(3)
+     # Leer CSV inmediatamente
+    if folder == 'extrac':
+        df= pd.read_csv(f'output/crossing_{principal_symbol}/{symbol}/is_os/is.csv')
+    else:
+        df= pd.read_csv(f'output/crossing_{principal_symbol}/{symbol}/is_os/os.csv')
     
-    if df is None or pos is None:
-        return
-    
+    start = datetime.strptime(str_start, '%Y-%m-%d')
+    pos, _ = _buscar_fecha_o_siguiente_fast(df, start)    
     # PRECALCULAR arrays numpy UNA sola vez - CRÍTICO para velocidad
     high = df['high'].to_numpy(np.float64)
     low = df['low'].to_numpy(np.float64)
     close = df['close'].to_numpy(np.float64)
     open_arr = df['open'].to_numpy(np.float64)
     time_arr = df['time'].to_numpy('datetime64[ns]')
-    
-    # Cargar CSV de referencia (is.csv u os.csv) UNA sola vez
-    if folder == 'extrac':
-        df_ref = pd.read_csv(f'output/crossing_{principal_symbol}/{symbol}/is_os/is.csv')
-    else:
-        df_ref = pd.read_csv(f'output/crossing_{principal_symbol}/{symbol}/is_os/os.csv')
-    
+     
     # Procesar TODOS los indicadores en paralelo
     with concurrent.futures.ProcessPoolExecutor(max_workers=min(30, len(indicators_files), os.cpu_count())) as executor:
         futures = {}
@@ -117,7 +83,7 @@ def create_files_fast(symbol, timeframe, str_start, end, indicators_files, folde
             future = executor.submit(
                 _generate_files_fast, 
                 file, pos, symbol, str_start, end, timeframe, folder,
-                high, low, close, open_arr, time_arr, df_ref
+                high, low, close, open_arr, time_arr, df
             )
             futures[future] = file
         

@@ -39,6 +39,7 @@ from src.db.create_db import create_db
 from src.db import query as db_query
 from src.utils.crossing_funtion.crear_indicadores_in_crossing import extract_indicadores
 from src.utils.crossing_funtion.create_erff import create_erff
+from src.utils.crossing_funtion.extrat_data import extract_data_crossing
 
 
 
@@ -1006,38 +1007,42 @@ if __name__ == "__main__":
 
     peticiones.initialize_mt5()
     tim.sleep(3)
+    
+    
+    
+    extract_data_crossing()
+    
+    #extract_indicadores()
+    # create_erff(list_symbol, principal_symbol)
 
-    extract_indicadores()
-    create_erff(list_symbol, principal_symbol)
+    # freeze_support()
 
-    freeze_support()
+    # manager = Manager()
+    # MIC_STATUS = manager.dict(
+    #     {mic: True for mic in MIC_DEVICES}
+    # )
 
-    manager = Manager()
-    MIC_STATUS = manager.dict(
-        {mic: True for mic in MIC_DEVICES}
-    )
+    # p1 = Process(
+    #     target=execute_crossing_builder,
+    #     args=('UP', MIC_STATUS)
+    # )
 
-    p1 = Process(
-        target=execute_crossing_builder,
-        args=('UP', MIC_STATUS)
-    )
+    # p2 = Process(
+    #     target=execute_crossing_builder,
+    #     args=('DOWN', MIC_STATUS)
+    # )
 
-    p2 = Process(
-        target=execute_crossing_builder,
-        args=('DOWN', MIC_STATUS)
-    )
+    # p1.start()
+    # tim.sleep(5)
+    # p2.start()
 
-    p1.start()
-    tim.sleep(5)
-    p2.start()
+    # p1.join()
+    # p2.join()
 
-    p1.join()
-    p2.join()
+    # with open('config/state.json', 'w', encoding='utf-8') as f:
+    #     json.dump({"state": "stopped"}, f, indent=4)
 
-    with open('config/state.json', 'w', encoding='utf-8') as f:
-        json.dump({"state": "stopped"}, f, indent=4)
-
-    print("Ambos procesos han terminado.")
+    # print("Ambos procesos han terminado.")
     print(
         f"Tiempo total de ejecución: "
         f"{tim.time() - inicio:.4f} segundos"

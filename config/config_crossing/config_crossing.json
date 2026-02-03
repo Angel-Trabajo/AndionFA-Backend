@@ -8,35 +8,15 @@
     "intentos": 1,
     "aumento_arboles": 300,
     "aumento_profundidad": 12,
-    "list_symbols": [
-        "EURAUD",
-        "EURCAD",
-        "EURCHF",
-        "EURMXN",
-        "EURNOK",
-        "EURNZD",
-        "EURSEK",
-        "EURTRY",
-        "EURUSD",
-        "GBPAUD",
-        "GBPCAD",
-        "GBPCHF",
-        "GBPMXN",
-        "GBPNOK",
-        "GBPNZD",
-        "GBPSEK",
-        "GBPTRY",
-        "GBPUSD"
-    ],
+    "list_symbols_bruto":["AUDCAD", "AUDCHF", "AUDJPY", "AUDNZD", "AUDUSD", "CADCHF", "CADJPY", "CHFJPY",
+            "EURAUD", "EURCAD", "EURCHF", "EURGBP", "EURJPY", "EURMXN", "EURNOK", "EURNZD",
+            "EURSEK", "EURTRY", "GBPAUD", "GBPCAD", "GBPCHF", "GBPJPY", "GBPMXN",
+            "GBPNOK", "GBPNZD", "GBPSEK", "GBPTRY", "GBPUSD", "NZDCAD", "NZDCHF", "NZDJPY",
+            "NZDUSD", "USDCAD", "USDCHF", "USDJPY", "USDMXN", "USDNOK", "USDSEK",
+            "USDSGD", "USDTRY"],
     "principal_symbol": "EURUSD",
     "timeframe": "H1",
     "por_direccion": true,
-    "list_symbols_inversos": [
-        "GBPAUD",
-        "GBPCAD",
-        "GBPCHF",
-        "GBPMXN",
-        "GBPNOK",
-        "GBPNZD"
-    ]
+    "list_symbols_inversos": [],
+    "list_symbols": []
 }
