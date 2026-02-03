@@ -41,3 +41,4 @@ if __name__ == "__main__":
 
 #./env/Scripts/activate
 #uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+# 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

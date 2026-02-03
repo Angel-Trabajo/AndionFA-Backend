@@ -18,8 +18,8 @@ from weka.classifiers import Classifier
 from src.routes import peticiones
 from src.db.create_db import create_db
 from src.db import query as db_query
-from src.utils.scripts.crear_indicadores_in_crossing import extract_indicadores
-from src.utils.scripts.create_erff import create_erff
+from src.utils.crossing_funtion.crear_indicadores_in_crossing import extract_indicadores
+from src.utils.crossing_funtion.create_erff import create_erff
 
 
 
