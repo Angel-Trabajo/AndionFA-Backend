@@ -20,6 +20,7 @@ from src.db.create_db import create_db
 from src.db import query as db_query
 from src.utils.crossing_funtion.crear_indicadores_in_crossing import extract_indicadores
 from src.utils.crossing_funtion.create_erff import create_erff
+from src.utils.crossing_funtion.extrat_data import extract_data_crossing, select_symbols_correl
 
 
 
@@ -56,7 +57,7 @@ with open('config/config_node/config_node.json', encoding='utf-8') as f:
 
 principal_symbol = config['principal_symbol']
 timeframe = config['timeframe'] 
-list_symbol = config['list_symbols']
+list_symbol = config['list_symbol']
 maximo_weka_trees = config['maximo_weka_tree']
 NumMax_Operations = config_node['NumMaxOperations']
 min_operaciones = config['min_operaciones']
@@ -66,7 +67,7 @@ intentos = config['intentos']
 aumento_arboles = config['aumento_arboles']
 aumento_profundidad = config['aumento_profundidad']
 por_direccion = config['por_direccion']
-list_symbols_inversos = config['list_symbols_inversos']
+list_symbols_inversos = config['list_symbol_inversos']
 
 _DF_CACHE = {}
 
@@ -561,6 +562,8 @@ if __name__ == "__main__":
     peticiones.initialize_mt5()
     tim.sleep(3)
     
+    extract_data_crossing()
+    select_symbols_correl()
     extract_indicadores()
     create_erff(list_symbol, principal_symbol)
     

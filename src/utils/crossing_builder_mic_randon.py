@@ -421,6 +421,7 @@ def selecte_nodes(
     # -------------------------------------------------
     # Filtrado por dirección
     # -------------------------------------------------
+            
     if por_direccion:
         if symbol in list_symbols_inversos:
             list_nodos = [n for n in list_nodos if n['label'] != action]
@@ -429,7 +430,7 @@ def selecte_nodes(
 
     if not list_nodos:
         return
-
+    
     # -------------------------------------------------
     # Cargar indicadores
     # -------------------------------------------------
@@ -714,7 +715,7 @@ def procesar_archivo(
                     f"output/crossing_{principal_symbol}/{symbol}/data_arff/"
                     f"{file.replace('.csv', '')}.arff"
                 )
-                for _ in range(30):
+                for _ in range(2):
                     seed = str(
                         random.sample(
                             range(1, 100001),
@@ -771,7 +772,6 @@ def procesar_archivo(
         print(f"Error crítico en {file}: {e}")
 
 
-
 # ==========================================================
 # INICIALIZACIÓN WORKER WEKA
 # ==========================================================
@@ -800,7 +800,7 @@ def create_trees(symbol, action, NumMaxOperations, cont, list_symbol, aumentar_t
     porcent_aumento_is =calcular_porcentage(symbol, prev_is)
     
     amount_file = len(list_files)
-    MAX_PROCESOS = 20  # ajustable según CPU
+    MAX_PROCESOS = 1  # ajustable según CPU
 
     with ProcessPoolExecutor(
         max_workers=MAX_PROCESOS,
@@ -904,7 +904,7 @@ def execute_crossing_builder(action, mic_status):
             db_query.promedio_correct_percentage(principal_symbol, action, 'is')
             if cont == 0 else
             db_query.promedio_correct_percentage(
-                f'crossing_{principal_symbol}_dbs/{list_symbol_hechos['list'][-1]}', action, 'is')
+                f'crossing_{principal_symbol}_dbs/{list_symbol_hechos["list"][-1]}', action, 'is')
         )
         
         prev_os = (

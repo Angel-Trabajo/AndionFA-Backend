@@ -32,7 +32,7 @@ with open('config/config_node/config_node.json', encoding='utf-8') as f:
 
 principal_symbol = config['principal_symbol']
 timeframe = config['timeframe'] 
-list_symbol = config['list_symbols']
+list_symbol = config['list_symbol']
 
 
 def extract_indicadores():

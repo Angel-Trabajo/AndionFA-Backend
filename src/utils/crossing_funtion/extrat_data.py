@@ -5,6 +5,7 @@ import sys
 import pandas as pd
 import time as tim
 import numpy as np
+import shutil
 
 sys.path.append(
     os.path.abspath(
@@ -20,15 +21,17 @@ _mapping_time = peticiones.get_timeframes()
 with open('config/config_crossing/config_crossing.json', 'r') as file:
     config = json.load(file)
 
-
 with open('config/config_node/config_node.json', encoding='utf-8') as f:
     config_node = json.load(f)
 
-
 principal_symbol = config['principal_symbol']
 timeframe = config['timeframe'] 
-#list_symbol = config['list_symbols']
-list_symbol_bruto = config['list_symbols_bruto']
+peticiones.initialize_mt5()
+list_symbol_bruto = peticiones.get_active_symbols()
+try:
+    list_symbol_bruto.remove(principal_symbol)
+except:
+    print(f'El symbol {principal_symbol} no está en la lista')
 
 
 
@@ -55,7 +58,6 @@ def _buscar_data(folder, sym, str_start, end):
 
 
 def extract_data_crossing():
-    peticiones.initialize_mt5()
     """Extrae indicadores optimizado - SIN cambios estructurales grandes"""
     indicators_files = os.listdir(f'output/extrac')
     texto = indicators_files[0]
@@ -91,27 +93,57 @@ def _pearson_binario_simple(df1, df2):
     return round(np.corrcoef(x, y)[0, 1], 2)
 
       
-def select_symbols():
-
+def select_symbols_correl():
     df_os_principal = _create_label(pd.read_csv('output/is_os/os.csv'))
     df_is_principal = _create_label(pd.read_csv('output/is_os/is.csv'))
     
     list_symbol = []
     list_symbol_inversos = []
     list_symbol_delete = []
+    dict_symbol_correl = {}
     
     
     for i ,symbol in enumerate(list_symbol_bruto):
 
         df_os = _create_label(pd.read_csv(f'output/crossing_{principal_symbol}/{symbol}/is_os/os.csv'))
+        correla_os = _pearson_binario_simple(df_os_principal, df_os)
+        if abs(correla_os) < 0.2:
+            list_symbol_delete.append(symbol)
+            continue
+         
         df_is = _create_label(pd.read_csv(f'output/crossing_{principal_symbol}/{symbol}/is_os/is.csv'))
+        correla_is =_pearson_binario_simple(df_is_principal, df_is)
+        if abs(correla_is) < 0.2:
+            list_symbol_delete.append(symbol)
+            continue
+        if abs(correla_os - correla_is) > 0.1:
+            list_symbol_delete.append(symbol)
+            continue
         
-        print(i+1, '---->', _pearson_binario_simple(df_os_principal, df_os),':', _pearson_binario_simple(df_is_principal, df_is))
+        list_symbol.append(symbol)
+        dict_symbol_correl[symbol]= round(((abs(correla_is) + abs(correla_os))/2), 3)
         
-        
-            
+        if correla_os < 0 :
+            list_symbol_inversos.append(symbol) 
+            print(f'{symbol}-> agregado a la lista de symbols inversos con correlación: os {correla_os}  is {correla_is}')
+        else:
+            print(f'{symbol}-> agregado a la lista de symbols con correlación: os {correla_os}  is {correla_is}')
+           
+    config['dict_symbol_correl'] = dict_symbol_correl
+    config['list_symbol_inversos'] = list_symbol_inversos
+    config['list_symbol'] = list_symbol
+    with open('config/config_crossing/config_crossing.json', 'w') as file:
+        json.dump(config, file, indent=4)           
+    
+    for symbol in list_symbol_delete:
+        ruta = f"output/crossing_{principal_symbol}/{symbol}"
+        if os.path.exists(ruta):
+            shutil.rmtree(ruta)
+            print(f'{symbol} eliminada data')
+    
     
 if __name__ == '__main__':
-    select_symbols()
+    select_symbols_correl()
+    
 
     
