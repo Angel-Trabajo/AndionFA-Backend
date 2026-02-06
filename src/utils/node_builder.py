@@ -6,13 +6,11 @@ from concurrent.futures import ProcessPoolExecutor
 import operator
 
 import pandas as pd
-import arff
-from weka.core.converters import Loader
-from weka.classifiers import Classifier
 from src.utils.create_indicators import create_files
 from src.db.create_db import create_db
 from src.db import query as db_query
 from src.routes import peticiones
+from src.utils.crossing_funtion.constructor_node import NodeGenerator
 
 
 with open('config/config_node/config_node.json', encoding='utf-8') as f:
@@ -28,93 +26,7 @@ operadores = {
 }
 
 
-def _create_erff(file_name:str):
-    df = pd.read_csv(f"output/extrac/{file_name}")
-    df = df.drop('time', axis=1)
-    clase = 'label'  # Nombre variable objetivo
-    columns = [c for c in df.columns if c != clase] + [clase]
-    df = df[columns]
-    attributes = []
-    for col in df.columns:
-        if df[col].dtype == object:
-            unique_vals = sorted(df[col].dropna().unique().tolist())
-            attributes.append((col, unique_vals))
-        else:
-            attributes.append((col, 'REAL'))
 
-    arff_dict = {
-        'relation': 'mi_dataset',
-        'attributes': attributes,
-        'data': df.values.tolist()
-    }
-    with open(f"output/data_arff/{file_name.replace('.csv', '')}.arff", 'w') as f:
-        arff.dump(arff_dict, f)
-
-
-def _create_tree(file_name : str, seed : str, max_depth):
-    loader = Loader(classname="weka.core.converters.ArffLoader")
-    data = loader.load_file(f"output/data_arff/{file_name.replace('.csv', '')}.arff")
-    data.class_is_last()
-    print("Total instancias:", data.num_instances)
-    tree = Classifier(classname="weka.classifiers.trees.REPTree",
-                    options=[
-                        "-M", "2", 
-                        "-V", "0.001", 
-                        "-N", "3", 
-                        "-S", seed,
-                        "-L", max_depth,
-                        '-num-decimal-places', '5'
-                        ])
-   
-    tree.build_classifier(data)
-    #------------------------------------------------------
-    # dire = file_name.replace('.csv', '')
-    # file_name = file_name.replace('.csv', f'_{seed}.txt')
-    # ruta_archivo = pathlib.Path(f"output/trees/{dire}/{file_name}")
-    # ruta_archivo.parent.mkdir(parents=True, exist_ok=True)
-    # with open(ruta_archivo, 'w') as f:
-    #     f.write(tree.jobject.toString())
-    print(f'create tree with seed: {seed}')
-    #--------------------------------------------------------
-    tree_lines = str(tree).splitlines()[4:-2]
-    return  tree_lines
-
-
-def _parse_ratios(r1, r2):
-    try:
-        a1, b1 = map(int, r1.strip("()[]").split("/"))
-        a2, b2 = map(int, r2.strip("()[]").split("/"))
-        total = a1 + a2
-        bad = b1 + b2
-        good = total - bad
-        return total
-    except:
-        return 0, 0
-
-
-def _parse_condition(text):
-    parts = text.strip().split()
-    return (parts[0], parts[1], float(parts[2]))
-
-
-def _parse_tree(tree_lines):
-    nodos, conditions = [], []
-    for line in tree_lines:
-        indent = line.count('|')
-        content = line.split('|')[-1].strip()
-        if ':' in content:
-            rule, stats = content.split(':')
-            label, ratio1, ratio2 = stats.strip().split()
-            total = _parse_ratios(ratio1, ratio2)
-            if total >= backtest_config["NTotal"]:
-                conditions = conditions[:indent] + [_parse_condition(rule)]
-                nodos.append({"label": label, "conditions": conditions})
-        else:
-            cond = _parse_condition(content)
-            if indent < len(conditions): conditions[indent] = cond
-            else: conditions.append(cond)
-    return nodos
-   
 
 def cumple_condiciones(df, condiciones):
     """
@@ -163,14 +75,10 @@ def convertir_a_pips(valores, simbolo):
     return [round(float(v) * multiplicador, 2) for v in valores]
 
 
-def selecte_nodes(file: str, op_down, op_up, symbol):
+def selecte_nodes(file: str, op_down, op_up, symbol, list_nodos):
     """
     Versión optimizada con NumPy/Pandas vectorizado
     """
-    # Cargar datos (igual)
-    with open(f"output/nodos/{file.replace('.csv', '')}.json", 'r', encoding='utf-8') as f:
-        list_nodos = json.load(f)
-    
     ext = file.split('_')[0]
     symbolo = file.split('_')[1]
     
@@ -313,9 +221,20 @@ def selecte_nodes(file: str, op_down, op_up, symbol):
         
         # Consulta DB (esta parte ya es rápida)
         list_dates_is = merged_is['time'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
-        nodo_mas_parecido = db_query.nodo_con_mas_fechas_hora_comunes(symbol, list_dates_is)
+       
         
-        # ... (resto de lógica DB igual) ...
+        nodo_mas_parecido = db_query.nodo_con_mas_fechas_hora_comunes(symbol, list_dates_is)
+        if nodo_mas_parecido:
+            coincidencias = nodo_mas_parecido['coincidencias']
+            total_operaciones = nodo_mas_parecido['total_operations']
+            porciento_nodo_db = coincidencias/total_operaciones
+            porciento_is = coincidencias/total_is
+            porciento = (porciento_nodo_db + porciento_is)/2
+            if porciento >=backtest_config['SimilarityMax'] and nodo_mas_parecido['total_operations'] < total_is:
+                db_query.eliminar_nodo_y_registros(symbol, nodo_mas_parecido['node_id']) 
+            elif porciento >=backtest_config['SimilarityMax'] and nodo_mas_parecido['total_operations'] >= total_is: 
+                print('Mayor pero el de la db mejor')
+                continue
         
         # Insertar en DB
         db_query.insertar_nodo_con_registros(
@@ -335,29 +254,21 @@ def selecte_nodes(file: str, op_down, op_up, symbol):
             veneficios_os=beneficios_netos_os.round(2).tolist()
         )
         
+   
         
-def procesar_archivo(file:str, max_depth, symbol):
-    import weka.core.jvm as jvm
-    jvm.start(packages=True)
-    try:
-        operaciones_exitosas_UP = 0
-        operaciones_exitosas_DOWN = 0
-        while operaciones_exitosas_UP < backtest_config['NumMaxOperations'] or operaciones_exitosas_DOWN < backtest_config['NumMaxOperations']:
-            _create_erff(file)
-            seed = str(random.sample(range(1, 100001), k=100000)[0])
-            tree_lines = _create_tree(file, seed, max_depth)
-            nodos = _parse_tree(tree_lines)
-            with open(f"output/nodos/{file.replace('.csv', '')}.json", 'w', encoding='utf-8') as f:
-                json.dump(nodos, f, ensure_ascii=False, indent=4)
-            selecte_nodes(file, operaciones_exitosas_DOWN, operaciones_exitosas_UP, symbol)
-            operaciones_exitosas_UP = db_query.successful_operations_by_label(symbol, 'UP')
-            operaciones_exitosas_DOWN = db_query.successful_operations_by_label(symbol,'DOWN')
-                     
-    
-    except Exception as e:
-        return f"Error en {file}: {str(e)}"
-    finally:
-        jvm.stop()
+def procesar_archivo(file:str, symbol):
+    df = pd.read_csv(f"output/extrac/{file}")
+    node_generator = NodeGenerator(df)
+    operaciones_exitosas_UP = 0
+    operaciones_exitosas_DOWN = 0
+    while operaciones_exitosas_UP < backtest_config['NumMaxOperations'] or operaciones_exitosas_DOWN < backtest_config['NumMaxOperations']:
+        list_nodos = node_generator.generar_nodos(1000)
+        selecte_nodes(file, operaciones_exitosas_DOWN, operaciones_exitosas_UP, symbol, list_nodos)
+        operaciones_exitosas_UP = db_query.successful_operations_by_label(symbol, 'UP')
+        operaciones_exitosas_DOWN = db_query.successful_operations_by_label(symbol,'DOWN')
+                    
+
+  
 
 
 def create_trees(symbol, timeframe):  
@@ -373,7 +284,7 @@ def create_trees(symbol, timeframe):
     
     with ProcessPoolExecutor(max_workers=MAX_PROCESOS) as executor:
         for file in list_files:
-            future = executor.submit(procesar_archivo, file, backtest_config['maxDepth'], symbol)
+            future = executor.submit(procesar_archivo, file, symbol)
             futures.append(future)
 
     db_query.insertar_nodo_con_registros(

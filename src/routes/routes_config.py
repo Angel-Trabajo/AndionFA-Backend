@@ -16,6 +16,7 @@ from ..models.indicators import IndicatorsRequest, ConfigRequest, NodeIndRequest
 from src.utils.create_indicators import create_files
 from src.utils.node_builder import create_trees
 from src.db.query import get_nodes
+from src.utils.crossing_funtion.extrat_data import extract_data_crossing, select_symbols_correl
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -279,23 +280,13 @@ async def get_crossing_config():
 
 @router.post("/set-crossing-config")
 async def set_crossing_config(request: ConfigCrossingRequest):
-    list_symbols = [symbol.value for symbol in request.list_symbols]
     print(request.list_symbols)
     data = {
-        "max_sri": request.max_sri,
-        "min_sri": request.min_sri,
         "n_totales": request.n_totales,
         "min_operaciones": request.min_operaciones,
-        "max_depth": request.max_depth,
-        "maximo_weka_tree": request.maximo_weka_tree,
-        "intentos": request.intentos,
-        "aumento_arboles": request.aumento_arboles,
-        "aumento_profundidad": request.aumento_profundidad,
-        "list_symbols": list_symbols,
         "principal_symbol": request.principal_symbol,
         "timeframe": request.timeframe,
         "por_direccion": request.por_direccion,
-        "list_symbols_inversos": [symbol.value for symbol in request.list_symbols_inversos]
     }
     with open('config/config_crossing/config_crossing.json', 'w', encoding='utf8') as file:
         json.dump(data, file, indent=4, ensure_ascii=False)
@@ -354,14 +345,11 @@ async def execute_crossing():
                 json.dump({"list": []}, f, indent=4)
     with open('config/list_DOWN.json', 'w', encoding='utf-8') as f:
                 json.dump({"list": []}, f, indent=4)
-    with open('config/three_cont_UP.json', 'w', encoding='utf-8') as f:
-            json.dump({"cont": 0}, f, indent=4)
-    with open('config/three_cont_DOWN.json', 'w', encoding='utf-8') as f:
-            json.dump({"cont": 0}, f, indent=4)
+
     list_dir = os.listdir('output')
     for dir in list_dir:
-        info = dir.split('_')[-1]
-        if info == 'UP' or info == 'DOWN':
+        info = dir.split('_')[0]
+        if info == 'crossing':
             eliminar_ruta(f'output/{dir}')
     list_dir = os.listdir('output/db')
     for dir in list_dir:
@@ -369,7 +357,10 @@ async def execute_crossing():
         if info == 'dbs':
             eliminar_ruta(f'output/db/{dir}')
             break 
-    script_path = Path(__file__).resolve().parent.parent / "utils" / "crossing_builder.py"
+    extract_data_crossing()
+    select_symbols_correl()   
+     
+    script_path = Path(__file__).resolve().parent.parent / "utils" / "crossing_builder_mic_randon.py"
     process2 = subprocess.Popen(
         [sys.executable, str(script_path)],
         stdout=None,   # hereda consola

@@ -2,14 +2,13 @@ import json
 import os
 import sys
 import operator
-import random
 import subprocess
 import struct
 import uuid
-import time as tim
+import time 
 
-from datetime import time
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import (
     Process,
     Queue,
@@ -19,10 +18,6 @@ from multiprocessing import (
 
 import pandas as pd
 import numpy as np
-
-from weka.core.converters import Loader
-from weka.classifiers import Classifier
-
 
 # ==========================================================
 # PATH
@@ -38,8 +33,7 @@ from src.routes import peticiones
 from src.db.create_db import create_db
 from src.db import query as db_query
 from src.utils.crossing_funtion.crear_indicadores_in_crossing import extract_indicadores
-from src.utils.crossing_funtion.create_erff import create_erff
-from src.utils.crossing_funtion.extrat_data import extract_data_crossing, select_symbols_correl
+from src.utils.crossing_funtion.constructor_node import NodeGenerator
 
 
 
@@ -82,11 +76,7 @@ with open('config/config_node/config_node.json', encoding='utf-8') as f:
 principal_symbol = config['principal_symbol']
 timeframe = config['timeframe']
 list_symbol = config['list_symbol']
-maximo_weka_trees = config['maximo_weka_tree']
 min_operaciones = config['min_operaciones']
-intentos = config['intentos']
-aumento_arboles = config['aumento_arboles']
-aumento_profundidad = config['aumento_profundidad']
 por_direccion = config['por_direccion']
 list_symbols_inversos = config['list_symbol_inversos']
 dict_symbol_correl = config['dict_symbol_correl']
@@ -147,100 +137,6 @@ def preparar_condiciones(conditions, col_index):
             (col_index[col], OP_MAP[op], value)
         )
     return compiled
-
-
-# ==========================================================
-# WEKA / CREACIÓN DE ÁRBOLES
-# ==========================================================
-
-def _create_tree(
-    seed: str,
-    max_depth,
-    aumentar_profundidad,
-    data
-):
-    max_depth = str(int(max_depth) + aumentar_profundidad)
-
-    data.class_is_last()
-    tree = Classifier(
-        classname="weka.classifiers.trees.REPTree",
-        options=[
-            "-M", "2",
-            "-V", "0.001",
-            "-N", "3",
-            "-S", seed,
-            "-L", max_depth,
-            "-num-decimal-places", "5"
-        ]
-    )
-
-    tree.build_classifier(data)
-
-    tree_lines = str(tree).splitlines()[4:-2]
-    return tree_lines
-
-
-# ==========================================================
-# PARSEO DE ÁRBOLES
-# ==========================================================
-
-def _parse_ratios(r1, r2):
-    try:
-        a1, b1 = map(int, r1.strip("()[]").split("/"))
-        a2, b2 = map(int, r2.strip("()[]").split("/"))
-
-        total = a1 + a2
-        bad = b1 + b2
-        good = total - bad
-
-        return total
-    except Exception:
-        return 0
-
-
-def _parse_condition(text):
-    parts = text.strip().split()
-    return (
-        parts[0],
-        parts[1],
-        float(parts[2])
-    )
-
-
-def _parse_tree(tree_lines):
-    nodos = []
-    conditions = []
-    for tree_line in tree_lines:
-        for line in tree_line:
-            indent = line.count('|')
-            content = line.split('|')[-1].strip()
-
-            if ':' in content:
-                rule, stats = content.split(':')
-                label, ratio1, ratio2 = stats.strip().split()
-
-                total = _parse_ratios(ratio1, ratio2)
-
-                if total >= config["n_totales"]:
-                    conditions = (
-                        conditions[:indent]
-                        + [_parse_condition(rule)]
-                    )
-
-                    nodos.append({
-                        "label": label,
-                        "conditions": conditions
-                    })
-            else:
-                cond = _parse_condition(content)
-
-                if indent < len(conditions):
-                    conditions[indent] = cond
-                else:
-                    conditions.append(cond)
-
-    return nodos
-
 
 # ==========================================================
 # EVALUACIÓN DE CONDICIONES (VECTORIZADA)
@@ -409,7 +305,7 @@ def selecte_nodes(
     action,
     cont,
     list_symbol,
-    list_nodos,
+    node_generator,
     mic_id,
     prev_os, 
     prev_is,
@@ -421,7 +317,9 @@ def selecte_nodes(
     # -------------------------------------------------
     # Filtrado por dirección
     # -------------------------------------------------
-            
+    ini = time.time()
+    list_nodos = node_generator.generar_nodos(10000)
+    print(f'10000 nodos creados en {time.time()-ini} segundos')        
     if por_direccion:
         if symbol in list_symbols_inversos:
             list_nodos = [n for n in list_nodos if n['label'] != action]
@@ -614,7 +512,7 @@ def selecte_nodes(
         porcentaje_is = aciertos_is / total_is
 
 
-        if not (prev_is + (porcent_aumento_is - 0.02) <= porcentaje_is <= prev_is + (porcent_aumento_os + 0.02)):
+        if not (prev_is + (porcent_aumento_is - 0.01) <= porcentaje_is <= prev_is + (porcent_aumento_os + 0.01)):
             continue
         
         
@@ -648,7 +546,8 @@ def selecte_nodes(
                     f'crossing_{principal_symbol}_dbs/{symbol}',
                     nodo_mas_parecido['node_id']
                 )
-            elif porciento >= config_node['SimilarityMax']:
+            elif porciento >=config_node['SimilarityMax'] and nodo_mas_parecido['total_operations'] >= total_is: 
+                print('Mayor pero el de la db mejor')
                 continue
 
         # -------------------------------------------------
@@ -677,116 +576,55 @@ def selecte_nodes(
 # PROCESAMIENTO DE ARCHIVOS (WORKER)
 # ==========================================================
 
-def procesar_archivo(
-    file: str,
-    max_depth,
-    symbol,
-    action,
-    NumMaxOperations,
-    cont,
-    list_symbol,
-    amount_file,
-    aumentar_tree,
-    aumentar_profundidad,
-    mic_id,
-    prev_os, 
-    prev_is,
-    porcent_aumento_os,
-    porcent_aumento_is
-):
-    try:
-        operaciones_exitosas = 0
-        amount_three = 0
-        max_three = (
-            maximo_weka_trees + aumentar_tree
-        ) * amount_file
-
-        while (
-            operaciones_exitosas < NumMaxOperations
-            and amount_three < max_three
-        ):
-            try:
-                tree_lines = []
-                loader = Loader(
-                    classname="weka.core.converters.ArffLoader"
-                )
-
-                data = loader.load_file(
-                    f"output/crossing_{principal_symbol}/{symbol}/data_arff/"
-                    f"{file.replace('.csv', '')}.arff"
-                )
-                for _ in range(2):
-                    seed = str(
-                        random.sample(
-                            range(1, 100001),
-                            k=100000
-                        )[0]
-                    )
-
-                    tree_lines.append(_create_tree( seed, max_depth, aumentar_profundidad, data))
-                
-                amount_three += 1
-                nodos = _parse_tree(tree_lines)
-
-                try:
-                    selecte_nodes(
-                        file,
-                        symbol,
-                        action,
-                        cont,
-                        list_symbol,
-                        nodos,
-                        mic_id,
-                        prev_os, 
-                        prev_is,
-                        porcent_aumento_os,
-                        porcent_aumento_is
-                    )
-                except RuntimeError as e:
-                    if "Unable to attach" in str(e):
-                        print(
-                            f"[MIC{mic_id}] fuera de servicio, "
-                            "se desactiva temporalmente"
-                        )
-                        MIC_STATUS[mic_id] = False
-                        raise
-
-                operaciones_exitosas = (
-                    db_query.successful_operations_by_label(
-                        f'crossing_{principal_symbol}_dbs/{symbol}',
-                        action
-                    )
-                )
-
+def procesar_archivo(file: str, symbol, action, NumMaxOperations, cont, list_symbol, mic_id, prev_os, prev_is, porcent_aumento_os, porcent_aumento_is):
+    
+    df = pd.read_csv(f'output/crossing_{principal_symbol}/{symbol}/extrac/{file}')
+    node_generator = NodeGenerator(df)
+    operaciones_exitosas = 0
+    while (operaciones_exitosas < NumMaxOperations):
+    
+        try:
+            selecte_nodes(
+                file,
+                symbol,
+                action,
+                cont,
+                list_symbol,
+                node_generator,
+                mic_id,
+                prev_os, 
+                prev_is,
+                porcent_aumento_os,
+                porcent_aumento_is
+            )
+        except RuntimeError as e:
+            if "Unable to attach" in str(e):
                 print(
-                    f"Operaciones exitosas "
-                    f"{symbol}-{action}: "
-                    f"{operaciones_exitosas}"
+                    f"[MIC{mic_id}] fuera de servicio, "
+                    "se desactiva temporalmente"
                 )
+                MIC_STATUS[mic_id] = False
+                raise
 
-            except Exception as e:
-                print(f"Error en {file}: {e}")
-                continue
+        operaciones_exitosas = (
+            db_query.successful_operations_by_label(
+                f'crossing_{principal_symbol}_dbs/{symbol}',
+                action
+            )
+        )
 
-    except Exception as e:
-        print(f"Error crítico en {file}: {e}")
-
-
-# ==========================================================
-# INICIALIZACIÓN WORKER WEKA
-# ==========================================================
-
-def init_worker():
-    import weka.core.jvm as jvm
-    if not jvm.started:
-        jvm.start(packages=True)
+        print(
+            f"Operaciones exitosas "
+            f"{symbol}-{action}: "
+            f"{operaciones_exitosas}"
+        )
 
 
 # ==========================================================
 # CREACIÓN DE ÁRBOLES (ORQUESTADOR)
 # ==========================================================
 
-def create_trees(symbol, action, NumMaxOperations, cont, list_symbol, aumentar_tree, aumentar_profundidad, prev_os, prev_is):
+def create_trees(symbol, action, NumMaxOperations, cont, list_symbol, prev_os, prev_is):
     db_path = f'output/db/crossing_{principal_symbol}_dbs/{symbol}.db'
 
     if not os.path.exists(db_path):
@@ -799,12 +637,10 @@ def create_trees(symbol, action, NumMaxOperations, cont, list_symbol, aumentar_t
     porcent_aumento_os =calcular_porcentage(symbol, prev_os)
     porcent_aumento_is =calcular_porcentage(symbol, prev_is)
     
-    amount_file = len(list_files)
-    MAX_PROCESOS = 1  # ajustable según CPU
+    MAX_PROCESOS = 20  # ajustable según CPU
 
     with ProcessPoolExecutor(
         max_workers=MAX_PROCESOS,
-        initializer=init_worker
     ) as executor:
 
         for i, file in enumerate(list_files):
@@ -812,15 +648,11 @@ def create_trees(symbol, action, NumMaxOperations, cont, list_symbol, aumentar_t
             executor.submit(
                 procesar_archivo,
                 file,
-                config['max_depth'],
                 symbol,
                 action,
                 NumMaxOperations,
                 cont,
                 list_symbol,
-                amount_file,
-                aumentar_tree,
-                aumentar_profundidad,
                 mic_id, 
                 prev_os,
                 prev_is,
@@ -889,11 +721,8 @@ def execute_crossing_builder(action, mic_status):
     cont = 0
     prosedio = True
     NumMaxOperations = NumMax_Operations
-
-    list_symbol_lost = []
-    aumentar_tree = 0
-    aumentar_profundidad = 0
-
+    
+    
     while cont < len(list_symbol):
         symbol = list_symbol[cont]
 
@@ -915,7 +744,7 @@ def execute_crossing_builder(action, mic_status):
             )
         )
         
-        print(prev_os, prev_is, '------------------------------------------------------------------------------------')
+        print(prev_os, prev_is, '---------')
         if prosedio:
             cont_symbol = len(list_symbol) - cont
             total_dismin = calcular_descuento(
@@ -932,81 +761,19 @@ def execute_crossing_builder(action, mic_status):
 
             NumMaxOperations -= NumMaxOperations * total_dismin
 
-        if symbol in list_symbol_lost:
-            cantidad = list_symbol_lost.count(symbol)
-            aumentar_tree = aumento_arboles * cantidad
-            aumentar_profundidad = aumento_profundidad * cantidad
+        create_trees(symbol, action, NumMaxOperations, cont, list_symbol, prev_os, prev_is)
+        cont += 1
+        prosedio = True
 
-        create_trees(
-            symbol,
-            action,
-            NumMaxOperations,
-            cont,
-            list_symbol,
-            aumentar_tree,
-            aumentar_profundidad,
-            prev_os,
-            prev_is
-        )
+        with open(f'config/list_{action}.json', 'r', encoding='utf-8') as f:
+            data = json.load(f)
 
-        operations = db_query.sum_successful_operations(
-            f'crossing_{principal_symbol}_dbs/{symbol}',
-            action
-        )
+        list_sym = data["list"]
+        list_sym.append(symbol)
 
-        if operations < NumMaxOperations:
-            print("Iteración fallida ----------------")
-
-            list_symbol.pop(cont)
-
-            cantidad = list_symbol_lost.count(symbol)
-            if cantidad < intentos:
-                list_symbol.append(symbol)
-
-            list_symbol_lost.append(symbol)
-
-            db_query.delete_nodes_by_label(
-                f'crossing_{principal_symbol}_dbs/{symbol}',
-                action
-            )
-
-            prosedio = False
-        else:
-            cont += 1
-            prosedio = True
-
-            with open(
-                f'config/list_{action}.json',
-                'r',
-                encoding='utf-8'
-            ) as f:
-                data = json.load(f)
-
-            list_sym = data["list"]
-            list_sym.append(symbol)
-
-            with open(
-                f'config/list_{action}.json',
-                'w',
-                encoding='utf-8'
-            ) as f:
-                json.dump(
-                    {"list": list_sym},
-                    f,
-                    indent=4
-                )
-
-            with open(
-                f'config/three_cont_{action}.json',
-                'w',
-                encoding='utf-8'
-            ) as f:
-                json.dump(
-                    {"cont": 0},
-                    f,
-                    indent=4
-                )
-
+        with open(f'config/list_{action}.json', 'w', encoding='utf-8') as f:
+            json.dump({"list": list_sym},f,indent=4)
+            
         print("NumMaxOperations actual:", NumMaxOperations)
 
 
@@ -1015,7 +782,7 @@ def execute_crossing_builder(action, mic_status):
 # ==========================================================
 
 if __name__ == "__main__":
-    inicio = tim.time()
+    inicio = time.time()
 
     with open('config/state.json', 'w', encoding='utf-8') as f:
         json.dump({"state": "running"}, f, indent=4)
@@ -1027,14 +794,10 @@ if __name__ == "__main__":
         json.dump({"list": []}, f, indent=4)
 
     peticiones.initialize_mt5()
-    tim.sleep(3)
+    time.sleep(3)
     
-    # extract_data_crossing()
-    # select_symbols_correl()
-     
-    # extract_indicadores()
-    # create_erff(list_symbol, principal_symbol)
-
+    #extract_indicadores()
+    
     freeze_support()
 
     manager = Manager()
@@ -1053,7 +816,7 @@ if __name__ == "__main__":
     )
 
     p1.start()
-    tim.sleep(5)
+    time.sleep(5)
     p2.start()
 
     p1.join()
@@ -1065,5 +828,5 @@ if __name__ == "__main__":
     print("Ambos procesos han terminado.")
     print(
         f"Tiempo total de ejecución: "
-        f"{tim.time() - inicio:.4f} segundos"
+        f"{time.time() - inicio:.4f} segundos"
     )

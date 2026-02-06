@@ -1,3 +1,9 @@
 {
-    "list": []
+    "list": [
+        "USDSEK",
+        "USDCHF",
+        "USDNOK",
+        "GBPUSD",
+        "AUDUSD"
+    ]
 }

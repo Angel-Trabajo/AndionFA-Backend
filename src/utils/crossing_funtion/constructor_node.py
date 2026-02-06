@@ -3,7 +3,7 @@ import random
 import pandas as pd
 import time
 
-MIN_COND = 4
+MIN_COND = 6
 MAX_COND = 12
 
 

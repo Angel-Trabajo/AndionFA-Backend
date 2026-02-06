@@ -1,11 +1,6 @@
 {
     "n_totales": 60,
-    "min_operaciones": 200.0,
-    "max_depth": "12",
-    "maximo_weka_tree": 500,
-    "intentos": 1,
-    "aumento_arboles": 300,
-    "aumento_profundidad": 12,
+    "min_operaciones": 400.0,
     "principal_symbol": "EURUSD",
     "timeframe": "H1",
     "por_direccion": true,
@@ -32,18 +27,18 @@
         "USDSEK"
     ],
     "list_symbol": [
-        "AUDUSD",
-        "CHFJPY",
-        "EURCAD",
-        "EURCHF",
-        "EURJPY",
-        "EURTRY",
-        "GBPUSD",
-        "NZDUSD",
-        "USDCAD",
+        "USDSEK",
         "USDCHF",
-        "USDJPY",
         "USDNOK",
-        "USDSEK"
+        "GBPUSD",
+        "AUDUSD",
+        "EURJPY",
+        "NZDUSD",
+        "EURCAD",
+        "EURTRY",
+        "USDCAD",
+        "EURCHF",
+        "USDJPY",
+        "CHFJPY"
     ]
 }

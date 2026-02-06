@@ -128,10 +128,31 @@ def select_symbols_correl():
             print(f'{symbol}-> agregado a la lista de symbols inversos con correlación: os {correla_os}  is {correla_is}')
         else:
             print(f'{symbol}-> agregado a la lista de symbols con correlación: os {correla_os}  is {correla_is}')
+    
+    new_list_symbol = []
+
+    for symbol in list_symbol:
+        
+        if len(new_list_symbol) == 0:
+            new_list_symbol.append(symbol)
+            continue
+
+        inserted = False
+
+        for i, existing_symbol in enumerate(new_list_symbol):
+            
+            if dict_symbol_correl[symbol] > dict_symbol_correl[existing_symbol]:
+                new_list_symbol.insert(i, symbol)
+                inserted = True
+                break
+
+        if not inserted:
+            new_list_symbol.append(symbol)
+        
            
     config['dict_symbol_correl'] = dict_symbol_correl
     config['list_symbol_inversos'] = list_symbol_inversos
-    config['list_symbol'] = list_symbol
+    config['list_symbol'] = new_list_symbol
     with open('config/config_crossing/config_crossing.json', 'w') as file:
         json.dump(config, file, indent=4)           
     
