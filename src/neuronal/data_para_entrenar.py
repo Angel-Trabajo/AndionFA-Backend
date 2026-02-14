@@ -165,15 +165,15 @@ def data_for_neuronal(algorithm, principal_symbol):
         .drop_duplicates(subset=['time'])
         .sort_values(by='time', ignore_index=True)
     )
-
+    df_primitiva["time"] = pd.to_datetime(df_primitiva["time"])
     # Cargar indicadores
     list_files_is = os.listdir('output/extrac/')
     list_files_os = os.listdir('output/extrac_os/')
     indicadores_dict = {}
 
     for name_is, name_os in zip(list_files_is, list_files_os):
-        df1 = pd.read_csv(f'output/extrac/{name_is}')
-        df2 = pd.read_csv(f'output/extrac_os/{name_os}')
+        df1 = pd.read_parquet(f'output/extrac/{name_is}')
+        df2 = pd.read_parquet(f'output/extrac_os/{name_os}')
         df = pd.concat([df1, df2], ignore_index=True).drop_duplicates(subset=['time'])
 
         # 🔽 MEJORA 2: evitar leakage de indicadores

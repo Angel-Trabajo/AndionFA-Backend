@@ -190,19 +190,20 @@ def evaluar_batch_mic_remote(remote_matrix, list_compiled_nodes, mic_id):
     mask = f"/tmp/mask_{uid}.bin"
 
     # escribir condiciones
-    with open("cond.bin", "wb") as f:
+    local_cond = f"cond_{uid}.bin"
+    with open(local_cond, "wb") as f:
         f.write(struct.pack("i", len(list_compiled_nodes)))
         for compiled in list_compiled_nodes:
             f.write(struct.pack("i", len(compiled)))
             for col, op, val in compiled:
                 f.write(struct.pack("iid", col, op, val))
 
-    with open("cond.bin", "rb") as f:
+    with open(local_cond, "rb") as f:
         subprocess.run(
             ["ssh", "-o", "StrictHostKeyChecking=no", host, f"cat > {cond}"],
             stdin=f, check=True
         )
-
+    os.remove(local_cond)
     # ejecutar MIC
     cmd = [
         "micnativeloadex",
@@ -261,7 +262,7 @@ def subir_matriz_mic(
     host = f"root@mic{mic_id}"
     rows, cols = matrix.shape
 
-    local = f"matrix_{tag}.bin"
+    local = f"matrix_{uuid.uuid4().hex}.bin"
     remote = f"/tmp/{local}"
 
     with open(local, "wb") as f:
@@ -305,7 +306,7 @@ def selecte_nodes(
     action,
     cont,
     list_symbol,
-    node_generator,
+    list_nodos,
     mic_id,
     prev_os, 
     prev_is,
@@ -317,15 +318,12 @@ def selecte_nodes(
     # -------------------------------------------------
     # Filtrado por dirección
     # -------------------------------------------------
-    ini = time.time()
-    list_nodos = node_generator.generar_nodos(10000)
-    print(f'10000 nodos creados en {time.time()-ini} segundos')        
+          
     if por_direccion:
         if symbol in list_symbols_inversos:
             list_nodos = [n for n in list_nodos if n['label'] != action]
         else:
-            list_nodos = [n for n in list_nodos if n['label'] == action]
-
+            list_nodos = [n for n in list_nodos if n['label'] == action]           
     if not list_nodos:
         return
     
@@ -576,13 +574,30 @@ def selecte_nodes(
 # PROCESAMIENTO DE ARCHIVOS (WORKER)
 # ==========================================================
 
-def procesar_archivo(file: str, symbol, action, NumMaxOperations, cont, list_symbol, mic_id, prev_os, prev_is, porcent_aumento_os, porcent_aumento_is):
+def procesar_archivo(file: str, symbol, action, NumMaxOperations, cont, list_symbol, mic_queue, prev_os, prev_is, porcent_aumento_os, porcent_aumento_is):
     
     df = pd.read_csv(f'output/crossing_{principal_symbol}/{symbol}/extrac/{file}')
     node_generator = NodeGenerator(df)
+    
+    print("Generando pool inicial grande de nodos...")
+    node_pool = node_generator.generar_nodos(200000)  # ajustable
+    pool_index = 0
+    print("Pool generado:", len(node_pool))
+        
+    
     operaciones_exitosas = 0
     while (operaciones_exitosas < NumMaxOperations):
-    
+        BATCH_SIZE = 20000
+
+        if pool_index + BATCH_SIZE > len(node_pool):
+            print("Regenerando pool...")
+            node_pool = node_generator.generar_nodos(200000)
+            pool_index = 0
+
+        batch_nodos = node_pool[pool_index: pool_index + BATCH_SIZE]
+        pool_index += BATCH_SIZE
+        mic_id = mic_queue.get()
+        print(f"MIC-{mic_id} asignada para {symbol}-{action} ({file})")
         try:
             selecte_nodes(
                 file,
@@ -590,21 +605,15 @@ def procesar_archivo(file: str, symbol, action, NumMaxOperations, cont, list_sym
                 action,
                 cont,
                 list_symbol,
-                node_generator,
+                batch_nodos,
                 mic_id,
                 prev_os, 
                 prev_is,
                 porcent_aumento_os,
                 porcent_aumento_is
             )
-        except RuntimeError as e:
-            if "Unable to attach" in str(e):
-                print(
-                    f"[MIC{mic_id}] fuera de servicio, "
-                    "se desactiva temporalmente"
-                )
-                MIC_STATUS[mic_id] = False
-                raise
+        finally:
+            mic_queue.put(mic_id)  # devolver la MIC pase lo que pase
 
         operaciones_exitosas = (
             db_query.successful_operations_by_label(
@@ -624,7 +633,7 @@ def procesar_archivo(file: str, symbol, action, NumMaxOperations, cont, list_sym
 # CREACIÓN DE ÁRBOLES (ORQUESTADOR)
 # ==========================================================
 
-def create_trees(symbol, action, NumMaxOperations, cont, list_symbol, prev_os, prev_is):
+def create_trees(symbol, action, NumMaxOperations, cont, list_symbol, prev_os, prev_is, mic_queue):
     db_path = f'output/db/crossing_{principal_symbol}_dbs/{symbol}.db'
 
     if not os.path.exists(db_path):
@@ -637,14 +646,13 @@ def create_trees(symbol, action, NumMaxOperations, cont, list_symbol, prev_os, p
     porcent_aumento_os =calcular_porcentage(symbol, prev_os)
     porcent_aumento_is =calcular_porcentage(symbol, prev_is)
     
-    MAX_PROCESOS = 20  # ajustable según CPU
+    MAX_PROCESOS = len(MIC_DEVICES)* 2  # ajustable según CPU
 
     with ProcessPoolExecutor(
         max_workers=MAX_PROCESOS,
     ) as executor:
 
-        for i, file in enumerate(list_files):
-            mic_id = MIC_DEVICES[i % 4]
+        for file in list_files:
             executor.submit(
                 procesar_archivo,
                 file,
@@ -653,7 +661,7 @@ def create_trees(symbol, action, NumMaxOperations, cont, list_symbol, prev_os, p
                 NumMaxOperations,
                 cont,
                 list_symbol,
-                mic_id, 
+                mic_queue,
                 prev_os,
                 prev_is,
                 porcent_aumento_os,
@@ -714,10 +722,7 @@ def calcular_porcentage(symbol, prev):
     return corre/sumatoria * (1-prev)
 
 
-def execute_crossing_builder(action, mic_status):
-    global MIC_STATUS
-    MIC_STATUS = mic_status
-
+def execute_crossing_builder(action, mic_queue):
     cont = 0
     prosedio = True
     NumMaxOperations = NumMax_Operations
@@ -761,7 +766,7 @@ def execute_crossing_builder(action, mic_status):
 
             NumMaxOperations -= NumMaxOperations * total_dismin
 
-        create_trees(symbol, action, NumMaxOperations, cont, list_symbol, prev_os, prev_is)
+        create_trees(symbol, action, NumMaxOperations, cont, list_symbol, prev_os, prev_is, mic_queue)
         cont += 1
         prosedio = True
 
@@ -801,18 +806,20 @@ if __name__ == "__main__":
     freeze_support()
 
     manager = Manager()
-    MIC_STATUS = manager.dict(
-        {mic: True for mic in MIC_DEVICES}
-    )
+
+    MIC_QUEUE = manager.Queue()
+
+    for mic in MIC_DEVICES:
+        MIC_QUEUE.put(mic)
 
     p1 = Process(
         target=execute_crossing_builder,
-        args=('UP', MIC_STATUS)
+        args=('UP', MIC_QUEUE)
     )
 
     p2 = Process(
         target=execute_crossing_builder,
-        args=('DOWN', MIC_STATUS)
+        args=('DOWN', MIC_QUEUE)
     )
 
     p1.start()

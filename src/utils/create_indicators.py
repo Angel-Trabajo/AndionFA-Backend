@@ -299,13 +299,15 @@ def _generate_files(indicator_file, pos, symbol, start, end, timeframe, folder):
 
     filename = indicator_file.replace(
         ".csv",
-        f"_{symbol}_{start_clean}_{end_clean}_timeframe{timeframe}.csv"
+        f"_{symbol}_{start_clean}_{end_clean}_timeframe{timeframe}.parquet"
     )
 
-    output_df.to_csv(
+    output_df.to_parquet(
         f"output/{folder}/{filename}",
-        index=False
-    )
+        index=False,
+        engine="pyarrow",
+        compression="snappy"# recomendado
+)
 
 
 

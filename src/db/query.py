@@ -2,58 +2,82 @@ import sqlite3
 import os
 from collections import Counter
 
-def insertar_nodo_con_registros(name, label, file_in_db, conditions, correct_percentage, successful_operations, total_operations, correct_percentage_os, successful_operations_os, total_operations_os, fechas=None, veneficios=None, fechas_os=None, veneficios_os=None):
-    conn = sqlite3.connect(f'output/db/{name}.db')
+import threading
+
+_thread_local = threading.local()
+
+def get_connection(db_path):
+
+    if not hasattr(_thread_local, "connections"):
+        _thread_local.connections = {}
+
+    if db_path not in _thread_local.connections:
+        conn = sqlite3.connect(
+            db_path,
+            timeout=30,
+            isolation_level=None,
+            check_same_thread=False
+        )
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        _thread_local.connections[db_path] = conn
+
+    return _thread_local.connections[db_path]
+
+def insertar_nodo_con_registros(
+    name, label, file_in_db, conditions,
+    correct_percentage, successful_operations, total_operations,
+    correct_percentage_os, successful_operations_os, total_operations_os,
+    fechas=None, veneficios=None, fechas_os=None, veneficios_os=None
+):
+
+    db_path = f'output/db/{name}.db'
+    conn = get_connection(db_path)
     cursor = conn.cursor()
 
-    # Verifica si ya existe un nodo con las mismas condiciones
-    cursor.execute('SELECT id FROM nodes WHERE conditions = ?', (conditions,))
+    cursor.execute(
+        'SELECT id FROM nodes WHERE conditions = ?',
+        (conditions,)
+    )
     nodo_existente = cursor.fetchone()
 
     if nodo_existente:
-        print("Nodo con las mismas condiciones ya existe. No se insertó.")
         nodo_id = nodo_existente[0]
     else:
         cursor.execute('''
             INSERT INTO nodes (
-                label, file_in_db, conditions, correct_percentage, successful_operations, total_operations,
+                label, file_in_db, conditions,
+                correct_percentage, successful_operations, total_operations,
                 correct_percentage_os, successful_operations_os, total_operations_os
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (label, file_in_db, conditions, correct_percentage, successful_operations, total_operations,
-              correct_percentage_os, successful_operations_os, total_operations_os))
-        nodo_id = cursor.lastrowid  # ID del nodo recién insertado
-        print("Nodo insertado correctamente.")
+        ''', (
+            label, file_in_db, conditions,
+            correct_percentage, successful_operations, total_operations,
+            correct_percentage_os, successful_operations_os, total_operations_os
+        ))
+        nodo_id = cursor.lastrowid
 
-    # Insertar registros en 'register'
+    # 🔥 INSERT MASIVO register
     if fechas and veneficios and len(fechas) == len(veneficios):
-        for fecha, beneficio in zip(fechas, veneficios):
-            cursor.execute('''
-                INSERT INTO register (node_id, dates, veneficios)
-                VALUES (?, ?, ?)
-            ''', (nodo_id, fecha, beneficio))
-        print(f"{len(fechas)} registros insertados en la tabla register.")
-    elif fechas or veneficios:
-        print("⚠️ Las listas de fechas y veneficios no son del mismo tamaño o están vacías. No se insertaron registros en 'register'.")
+        cursor.executemany(
+            'INSERT INTO register (node_id, dates, veneficios) VALUES (?, ?, ?)',
+            [(nodo_id, f, v) for f, v in zip(fechas, veneficios)]
+        )
 
-    # Insertar registros en 'register_os'
+    # 🔥 INSERT MASIVO register_os
     if fechas_os and veneficios_os and len(fechas_os) == len(veneficios_os):
-        for fecha, beneficio in zip(fechas_os, veneficios_os):
-            cursor.execute('''
-                INSERT INTO register_os (node_id, dates_os, veneficios_os)
-                VALUES (?, ?, ?)
-            ''', (nodo_id, fecha, beneficio))
-        print(f"{len(fechas_os)} registros insertados en la tabla register_os.")
-    elif fechas_os or veneficios_os:
-        print("⚠️ Las listas de fechas_os y veneficios_os no son del mismo tamaño o están vacías. No se insertaron registros en 'register_os'.")
+        cursor.executemany(
+            'INSERT INTO register_os (node_id, dates_os, veneficios_os) VALUES (?, ?, ?)',
+            [(nodo_id, f, v) for f, v in zip(fechas_os, veneficios_os)]
+        )
 
     conn.commit()
-    conn.close()
-
 
 
 def successful_operations_by_label(name, label: str) -> int:
-    conn = sqlite3.connect(f'output/db/{name}.db')
+    path = f'output/db/{name}.db'
+    conn = get_connection(path)
     cursor = conn.cursor()
 
     cursor.execute(
@@ -61,13 +85,12 @@ def successful_operations_by_label(name, label: str) -> int:
         (label,)
     )
     result = cursor.fetchone()[0]
-
-    conn.close()
     return result if result is not None else 0
 
 
 def nodo_con_mas_fechas_hora_comunes(name, lista_fechas):
-    conn = sqlite3.connect(f'output/db/{name}.db')
+    path = f'output/db/{name}.db'
+    conn = get_connection(path)
     cursor = conn.cursor()
 
     # Crear placeholders para la consulta SQL
@@ -81,7 +104,7 @@ def nodo_con_mas_fechas_hora_comunes(name, lista_fechas):
     ''', lista_fechas)
 
     resultados = cursor.fetchall()
-    conn.close()
+
 
     if not resultados:
         return None
@@ -96,11 +119,11 @@ def nodo_con_mas_fechas_hora_comunes(name, lista_fechas):
     coincidencias = conteo_por_nodo[node_id_mas_comun]
 
     # Obtener total_operations del nodo
-    conn = sqlite3.connect(f'output/db/{name}.db')
+    conn = get_connection(f'output/db/{name}.db')
     cursor = conn.cursor()
     cursor.execute('SELECT total_operations FROM nodes WHERE id = ?', (node_id_mas_comun,))
     resultado = cursor.fetchone()
-    conn.close()
+    
 
     if resultado:
         total_operations = resultado[0]
@@ -114,7 +137,8 @@ def nodo_con_mas_fechas_hora_comunes(name, lista_fechas):
     
     
 def eliminar_nodo_y_registros(name, node_id):
-    conn = sqlite3.connect(f'output/db/{name}.db')
+    path = f'output/db/{name}.db'
+    conn = get_connection(path)
     cursor = conn.cursor()
 
     # Eliminar registros relacionados en la tabla register
@@ -125,21 +149,21 @@ def eliminar_nodo_y_registros(name, node_id):
     cursor.execute('DELETE FROM nodes WHERE id = ?', (node_id,))
 
     conn.commit()
-    conn.close()
+    
 
     print(f"Nodo {node_id} y sus registros han sido eliminados.")
     
 
 
 def get_nodes(name):
-    conn = sqlite3.connect(f'output/db/{name}.db')
+    path = f'output/db/{name}.db'
+    conn = get_connection(path)
     cursor = conn.cursor()
 
     # Buscar todos los registros de la tabla 'nodes'
     cursor.execute('SELECT * FROM nodes')
     resultados = cursor.fetchall()
 
-    conn.close()
 
     if not resultados:
         return None
@@ -147,14 +171,14 @@ def get_nodes(name):
 
 
 def get_node_by_id(name, id_node):
-    conn = sqlite3.connect(f'output/db/{name}.db')
+    path = f'output/db/{name}.db'
+    conn = get_connection(path)
     cursor = conn.cursor()
 
     # Buscar el nodo con el id especificado
     cursor.execute('SELECT * FROM nodes WHERE id = ?', (id_node,))
     resultado = cursor.fetchone()
 
-    conn.close()
 
     if resultado is None:
         return None
@@ -171,7 +195,7 @@ def existe_registro(name, fecha_busqueda, label_busqueda, modo):
     if modo not in ("os", "is"):
         raise ValueError("El modo debe ser 'os' o 'is'")
 
-    conn = sqlite3.connect(db_path)
+    conn = get_connection(db_path)
     cursor = conn.cursor()
 
     if modo == "os":
@@ -194,7 +218,7 @@ def existe_registro(name, fecha_busqueda, label_busqueda, modo):
     cursor.execute(query, (label_busqueda, fecha_busqueda))
     resultado = cursor.fetchone()
 
-    conn.close()
+    
     return resultado is not None
 
 
@@ -208,7 +232,7 @@ def promedio_correct_percentage(name, label_busqueda, modo):
     if modo not in ("os", "is"):
         raise ValueError("El modo debe ser 'os' o 'is'")
 
-    conn = sqlite3.connect(db_path)
+    conn = get_connection(db_path)
     cursor = conn.cursor()
 
     if modo == "os":
@@ -227,13 +251,12 @@ def promedio_correct_percentage(name, label_busqueda, modo):
     cursor.execute(query, (label_busqueda,))
     resultado = cursor.fetchone()[0]
 
-    conn.close()
     return resultado  #
 
 
 def sum_successful_operations(db_name, label):
     db_path = f'output/db/{db_name}.db'
-    conn = sqlite3.connect(db_path)
+    conn = get_connection(db_path)
     cursor = conn.cursor()
 
     cursor.execute('''
@@ -243,14 +266,14 @@ def sum_successful_operations(db_name, label):
     ''', (label,))
     
     result = cursor.fetchone()[0]
-    conn.close()
+    
     
     # Si no hay registros, devuelve 0 en vez de None
     return result if result is not None else 0
 
 def delete_nodes_by_label(db_name, label):
     db_path = f'output/db/{db_name}.db'
-    conn = sqlite3.connect(db_path)
+    conn = get_connection(db_path)
     cursor = conn.cursor()
 
     # Paso 1: obtener todos los IDs de nodos con el label dado
@@ -259,7 +282,6 @@ def delete_nodes_by_label(db_name, label):
 
     if not node_ids:
         print(f"No se encontraron nodos con label '{label}'.")
-        conn.close()
         return
 
     # Paso 2: eliminar registros relacionados en register y register_os
@@ -270,13 +292,12 @@ def delete_nodes_by_label(db_name, label):
     cursor.execute("DELETE FROM nodes WHERE label = ?", (label,))
 
     conn.commit()
-    conn.close()
     print(f"Eliminados {len(node_ids)} nodos y sus registros asociados.")
     
     
 def get_dates_by_label(db_name, label, modo="is"):
     db_path = f'output/db/{db_name}.db'
-    conn = sqlite3.connect(db_path)
+    conn = get_connection(db_path)
     cursor = conn.cursor()
 
     # Obtener IDs de nodos con ese label
@@ -284,7 +305,6 @@ def get_dates_by_label(db_name, label, modo="is"):
     node_ids = [row[0] for row in cursor.fetchall()]
 
     if not node_ids:
-        conn.close()
         return tuple()  # Tupla vacía si no hay nodos
 
     # Elegir tabla y columna según el modo
@@ -303,32 +323,33 @@ def get_dates_by_label(db_name, label, modo="is"):
     # Obtener resultados como tupla
     results = tuple(row[0] for row in cursor.fetchall())
 
-    conn.close()
     return results
 
+
 def get_nodes_label(name, label):
-    conn = sqlite3.connect(f'output/db/{name}.db')
+    path = f'output/db/{name}.db'
+    conn = get_connection(path)
     cursor = conn.cursor()
 
     # Buscar todos los registros de la tabla 'nodes'
     cursor.execute('SELECT conditions FROM nodes WHERE label = ?', (label,))
     resultados = cursor.fetchall()
 
-    conn.close()
 
     if not resultados:
         return None
     return resultados
 
+
 def get_nodes_by_label(name, label):
-    conn = sqlite3.connect(f'output/db/{name}.db')
+    path = f'output/db/{name}.db'
+    conn = get_connection(path)
     cursor = conn.cursor()
 
     # Buscar todos los registros de la tabla 'nodes'
     cursor.execute('SELECT conditions, file_in_db FROM nodes WHERE label = ?', (label,))
     resultados = cursor.fetchall()
 
-    conn.close()
 
     if not resultados:
         return None

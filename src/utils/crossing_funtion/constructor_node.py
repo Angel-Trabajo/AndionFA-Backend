@@ -3,13 +3,10 @@ import random
 import pandas as pd
 import time
 
-MIN_COND = 6
-MAX_COND = 12
-
 
 class NodeGenerator:
 
-    def __init__(self, df, min_cond=4, max_cond=12):
+    def __init__(self, df, min_cond=6, max_cond=12):
 
         self.MIN_COND = min_cond
         self.MAX_COND = max_cond
@@ -95,7 +92,7 @@ if __name__ == '__main__':
     df = pd.read_csv('output/crossing_EURUSD/AUDUSD/extrac/Ext-011616_AUDUSD_20170101_20210101_timeframeH1.csv')
 
     gen = NodeGenerator(df)
-    nodos = gen.generar_nodos(10000)
+    nodos = gen.generar_nodos(100)
 
     print(nodos[0:3])
     print(time.time()-inicio)

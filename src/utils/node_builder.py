@@ -89,16 +89,16 @@ def selecte_nodes(file: str, op_down, op_up, symbol, list_nodos):
     if not dire:
         return
     
-    df_indicators_os = pd.read_csv(f'output/extrac_os/{dire}')
-    df_indicators_is = pd.read_csv(f'output/extrac/{file}')
+    df_indicators_os = pd.read_parquet(f'output/extrac_os/{dire}')
+    df_indicators_is = pd.read_parquet(f'output/extrac/{file}')
     df_os = pd.read_csv('output/is_os/os.csv')
     df_is = pd.read_csv('output/is_os/is.csv')
     
     # Convertir columnas time a datetime (una vez)
     for df in [df_os, df_is, df_indicators_os, df_indicators_is]:
-        if 'time' in df.columns:
+        if 'time' in df.columns and not pd.api.types.is_datetime64_any_dtype(df['time']):
             df['time'] = pd.to_datetime(df['time'])
-    
+        
     def normalizar_conditions(conditions):
         return json.dumps(conditions, sort_keys=True)
     
@@ -257,12 +257,12 @@ def selecte_nodes(file: str, op_down, op_up, symbol, list_nodos):
    
         
 def procesar_archivo(file:str, symbol):
-    df = pd.read_csv(f"output/extrac/{file}")
+    df = pd.read_parquet(f"output/extrac/{file}")
     node_generator = NodeGenerator(df)
     operaciones_exitosas_UP = 0
     operaciones_exitosas_DOWN = 0
     while operaciones_exitosas_UP < backtest_config['NumMaxOperations'] or operaciones_exitosas_DOWN < backtest_config['NumMaxOperations']:
-        list_nodos = node_generator.generar_nodos(1000)
+        list_nodos = node_generator.generar_nodos(100)
         selecte_nodes(file, operaciones_exitosas_DOWN, operaciones_exitosas_UP, symbol, list_nodos)
         operaciones_exitosas_UP = db_query.successful_operations_by_label(symbol, 'UP')
         operaciones_exitosas_DOWN = db_query.successful_operations_by_label(symbol,'DOWN')
@@ -279,7 +279,10 @@ def create_trees(symbol, timeframe):
     indicators_files = [file.split('_')[0]+'.csv'  for file in list_files]
     create_files(symbol, timeframe, backtest_config['dateStart'], backtest_config['dateEnd'], indicators_files, 'extrac_os')
     
-    MAX_PROCESOS = 25  # Puedes ajustar este número según tu CPU
+    MAX_PROCESOS = len(list_files)
+    if MAX_PROCESOS > 25:
+        MAX_PROCESOS = 25
+    # Puedes ajustar este número según tu CPU
     futures = []
     
     with ProcessPoolExecutor(max_workers=MAX_PROCESOS) as executor:

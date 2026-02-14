@@ -5,22 +5,18 @@ from datetime import time
 import time as tim
 import operator
 from concurrent.futures import ProcessPoolExecutor
-import random
 from multiprocessing import Process
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 
 import pandas as pd 
 import numpy as np
-from weka.core.converters import Loader
-from weka.classifiers import Classifier
 
 from src.routes import peticiones
 from src.db.create_db import create_db
 from src.db import query as db_query
 from src.utils.crossing_funtion.crear_indicadores_in_crossing import extract_indicadores
-from src.utils.crossing_funtion.create_erff import create_erff
-from src.utils.crossing_funtion.extrat_data import extract_data_crossing, select_symbols_correl
+from src.utils.crossing_funtion.constructor_node import NodeGenerator
 
 
 
@@ -58,16 +54,12 @@ with open('config/config_node/config_node.json', encoding='utf-8') as f:
 principal_symbol = config['principal_symbol']
 timeframe = config['timeframe'] 
 list_symbol = config['list_symbol']
-maximo_weka_trees = config['maximo_weka_tree']
-NumMax_Operations = config_node['NumMaxOperations']
 min_operaciones = config['min_operaciones']
-max_sri = config['max_sri']
-min_sri = config['min_sri']
-intentos = config['intentos']
-aumento_arboles = config['aumento_arboles']
-aumento_profundidad = config['aumento_profundidad']
 por_direccion = config['por_direccion']
 list_symbols_inversos = config['list_symbol_inversos']
+dict_symbol_correl = config['dict_symbol_correl']
+
+NumMax_Operations = config_node['NumMaxOperations']
 
 _DF_CACHE = {}
 
@@ -110,71 +102,6 @@ def preparar_condiciones(conditions, col_index):
     return compiled
 
 
-def _create_tree(file_name : str, seed : str, max_depth, symbol, action, aumentar_profundidad):
-    max_depth = str(int(max_depth) + aumentar_profundidad)
-    loader = Loader(classname="weka.core.converters.ArffLoader")
-    data = loader.load_file(f"output/crossing_{principal_symbol}/{symbol}/data_arff/{file_name.replace('.csv', '')}.arff")
-    data.class_is_last()
-    print("Total instancias:", data.num_instances)
-    tree = Classifier(classname="weka.classifiers.trees.REPTree",
-                    options=[
-                        "-M", "2", 
-                        "-V", "0.001", 
-                        "-N", "3", 
-                        "-S", seed,
-                        "-L", max_depth,
-                        '-num-decimal-places', '5'
-                        ])
-    tree.build_classifier(data)
-    
-    #------------------------------------------------------
-    with open(f'config/three_cont_{action}.json', 'r', encoding='utf-8') as f:
-            threes = json.load(f)
-    threes['cont'] += 1
-    with open(f'config/three_cont_{action}.json', 'w', encoding='utf-8') as f:
-        json.dump(threes, f)
-    print(f'create tree with seed: {seed}')
-    #--------------------------------------------------------
-    tree_lines = str(tree).splitlines()[4:-2]
-    return  tree_lines
-
-
-def _parse_ratios(r1, r2):
-    try:
-        a1, b1 = map(int, r1.strip("()[]").split("/"))
-        a2, b2 = map(int, r2.strip("()[]").split("/"))
-        total = a1 + a2
-        bad = b1 + b2
-        good = total - bad
-        return total
-    except:
-        return 0
-
-
-def _parse_condition(text):
-    parts = text.strip().split()
-    return (parts[0], parts[1], float(parts[2]))
-
-
-def _parse_tree(tree_lines):
-    nodos, conditions = [], []
-    for line in tree_lines:
-        indent = line.count('|')
-        content = line.split('|')[-1].strip()
-        if ':' in content:
-            rule, stats = content.split(':')
-            label, ratio1, ratio2 = stats.strip().split()
-            total = _parse_ratios(ratio1, ratio2)
-            if total >= config["n_totales"]:
-                conditions = conditions[:indent] + [_parse_condition(rule)]
-                nodos.append({"label": label, "conditions": conditions})
-        else:
-            cond = _parse_condition(content)
-            if indent < len(conditions): conditions[indent] = cond
-            else: conditions.append(cond)
-    return nodos
-
-
 def evaluar_condiciones_vectorizado(matrix, compiled_conditions):
     if matrix.shape[0] == 0:
         return np.array([], dtype=bool)
@@ -198,8 +125,24 @@ def dataframe_to_matrix(df, condition_cols):
     return data
 
 
-def selecte_nodes(file:str, symbol, action, cont, list_symbol, list_nodos):
-
+def selecte_nodes(
+        file,
+        symbol,
+        action,
+        cont,
+        list_symbol,
+        node_generator,  # generar nodos frescos para cada archivo
+        prev_os, 
+        prev_is,
+        porcent_aumento_os,
+        porcent_aumento_is
+    ):
+    
+    ini = tim.time()
+    cant_nodos = 1000 * (cont+1)
+    list_nodos = node_generator.generar_nodos(cant_nodos)
+    print(f"{cant_nodos} Nodos generados en {tim.time() - ini:.4f} segundos")
+    
     pip_mult = 100 if 'JPY' in symbol.upper() else 10_000
     if por_direccion:
         if symbol in list_symbols_inversos:
@@ -208,11 +151,29 @@ def selecte_nodes(file:str, symbol, action, cont, list_symbol, list_nodos):
             list_nodos = [nodo for nodo in list_nodos if nodo['label'] == action]
 
     ext = file.split('_')[0]
-    list_dire_indicators_os = os.listdir(f'output/crossing_{principal_symbol}/{symbol}/extrac_os')
-    dire = [file for file in list_dire_indicators_os if ext in file][0]
-    df_indicators_os = pd.read_csv(f'output/crossing_{principal_symbol}/{symbol}/extrac_os/{dire}', parse_dates=["time"])
-    df_indicators_is = pd.read_csv(f'output/crossing_{principal_symbol}/{symbol}/extrac/{file}', parse_dates=["time"])
+    dire = next(
+        f for f in os.listdir(
+            f'output/crossing_{principal_symbol}/{symbol}/extrac_os'
+        )
+        if ext in f
+    )
+    
+    
+    df_indicators_os = pd.read_parquet(
+        f'output/crossing_{principal_symbol}/{symbol}/extrac_os/{dire}'
+    )
 
+    df_indicators_is = pd.read_parquet(
+        f'output/crossing_{principal_symbol}/{symbol}/extrac/{file}'
+    )
+
+    # Convertir time manualmente
+    if "time" in df_indicators_os.columns:
+        df_indicators_os["time"] = pd.to_datetime(df_indicators_os["time"])
+
+    if "time" in df_indicators_is.columns:
+        df_indicators_is["time"] = pd.to_datetime(df_indicators_is["time"])
+        
     df_os = load_csv_cached('output/is_os/os.csv')
     df_is = load_csv_cached('output/is_os/is.csv')
     
@@ -222,6 +183,8 @@ def selecte_nodes(file:str, symbol, action, cont, list_symbol, list_nodos):
     
     def normalizar_conditions(conditions):
         return json.dumps(conditions, sort_keys=True)
+    
+    
     if cont == 0:
         list_oper_os =list(db_query.get_dates_by_label(principal_symbol, action, 'os'))
         list_oper_is = list(db_query.get_dates_by_label(principal_symbol, action, 'is'))
@@ -332,14 +295,11 @@ def selecte_nodes(file:str, symbol, action, cont, list_symbol, list_nodos):
         total = len(list_beneficio_os)
         if total == 0:
             continue
-        porcentaje_aciertos = (aciertos / total)
-        if cont == 0:
-            porcentaje_aciertos_anterior = db_query.promedio_correct_percentage(principal_symbol, action, 'os')
-        else:
-            porcentaje_aciertos_anterior = db_query.promedio_correct_percentage(f'crossing_{principal_symbol}_dbs/{list_symbol[cont-1]}', action, 'os')
-
-        if porcentaje_aciertos < porcentaje_aciertos_anterior + min_sri or porcentaje_aciertos > porcentaje_aciertos_anterior + max_sri:
+        porcentaje_os = (aciertos / total)
+        
+        if not (prev_os + (porcent_aumento_os - 0.02) <= porcentaje_os <= prev_os + (porcent_aumento_os + 0.02)):
             continue
+            
         progressive_os = total/len(df_indicators_os)
         
         #--------------------------------------------------------------------------------
@@ -390,19 +350,15 @@ def selecte_nodes(file:str, symbol, action, cont, list_symbol, list_nodos):
         if total_is ==0:
             continue
         porcentaje_aciertos_is = (aciertos_is / total_is)
-        if cont == 0:
-            porcentaje_aciertos_anterior = db_query.promedio_correct_percentage(principal_symbol, action, 'is')
-        else:
-            porcentaje_aciertos_anterior = db_query.promedio_correct_percentage(f'crossing_{principal_symbol}_dbs/{list_symbol[cont-1]}', action, 'is')
-
-        if porcentaje_aciertos_is < porcentaje_aciertos_anterior + min_sri or porcentaje_aciertos_is > porcentaje_aciertos_anterior + max_sri:
-            continue  
+        
+        if not (prev_is + (porcent_aumento_is - 0.01) <= porcentaje_aciertos_is <= prev_is + (porcent_aumento_is + 0.01)):
+            continue
         
         progressive_is = total_is/len(df_indicators_is) 
         progressiveVariation = abs(progressive_os - progressive_is)
         if progressiveVariation > config_node['ProgressiveVariation']:
             continue
-        
+       
         nodo_mas_parecido = db_query.nodo_con_mas_fechas_hora_comunes(f'crossing_{principal_symbol}_dbs/{symbol}', list_dates_is)
         if nodo_mas_parecido:
             coincidencias = nodo_mas_parecido['coincidencias']
@@ -425,7 +381,7 @@ def selecte_nodes(file:str, symbol, action, cont, list_symbol, list_nodos):
             correct_percentage= porcentaje_aciertos_is,
             successful_operations= aciertos_is,
             total_operations= total_is,
-            correct_percentage_os= porcentaje_aciertos,
+            correct_percentage_os= porcentaje_os,
             successful_operations_os= aciertos,
             total_operations_os= total,
             fechas=list_dates_is,
@@ -435,61 +391,101 @@ def selecte_nodes(file:str, symbol, action, cont, list_symbol, list_nodos):
         )
         
 
-def procesar_archivo(file:str, max_depth, symbol, action, NumMaxOperations, cont, list_symbol, amount_file, aumentar_tree, aumentar_profundidad):
+def procesar_archivo(file: str, symbol, action, NumMaxOperations, cont, list_symbol, prev_os, prev_is, porcent_aumento_os, porcent_aumento_is):
     
-    try:
-        operaciones_exitosas = 0
-        amount_three = 0
-        max_three = (maximo_weka_trees + aumentar_tree) * amount_file
-        while operaciones_exitosas < NumMaxOperations and amount_three < max_three:
-            try:
-                seed = str(random.sample(range(1, 100001), k=100000)[0])
-                tree_lines = _create_tree(file, seed, max_depth, symbol, action, aumentar_profundidad)
-                nodos = _parse_tree(tree_lines)  
-                selecte_nodes(file, symbol, action, cont, list_symbol, nodos)
-                operaciones_exitosas = db_query.successful_operations_by_label(f'crossing_{principal_symbol}_dbs/{symbol}', action)
-                with open(f'config/three_cont_{action}.json', 'r', encoding='utf-8') as f:
-                    threes = json.load(f)
-                amount_three = threes['cont']
-                print(f"estas son las operaciones exitosa en {symbol}-{action}: {operaciones_exitosas}")
-            except Exception  as e:
-                print(f"Error en {file}: {e}")
-                continue
-    except Exception as e:
-        print(f"Error en {file}: {e}")
+    df = pd.read_parquet(f'output/crossing_{principal_symbol}/{symbol}/extrac/{file}')
+    node_generator = NodeGenerator(df)
+    operaciones_exitosas = 0
+    while (operaciones_exitosas < NumMaxOperations):
+        
+        selecte_nodes(
+            file,
+            symbol,
+            action,
+            cont,
+            list_symbol,
+            node_generator,  # generar nodos frescos para cada archivo
+            prev_os, 
+            prev_is,
+            porcent_aumento_os,
+            porcent_aumento_is
+        )
+        operaciones_exitosas = (
+            db_query.successful_operations_by_label(
+                f'crossing_{principal_symbol}_dbs/{symbol}',
+                action
+            )
+        )
+
+        print(
+            f"Operaciones exitosas "
+            f"{symbol}-{action}: "
+            f"{operaciones_exitosas}"
+        )
+
    
-    
 def init_worker():
     import weka.core.jvm as jvm
     if not jvm.started:
         jvm.start(packages=True)
 
 
-def create_trees(symbol, action, NumMaxOperations, cont, list_symbol, aumentar_tree, aumentar_profundidad):
+def calcular_porcentage(symbol, prev):
+    sumatoria = 0
+    for key, value in dict_symbol_correl.items():
+        sumatoria += value
+    corre = dict_symbol_correl[symbol]
+    return corre/sumatoria * (1-prev)
 
-    if not os.path.exists(f'output/db/crossing_{principal_symbol}_dbs/{symbol}.db'):
+
+def create_trees(symbol, action, NumMaxOperations, cont, list_symbol, prev_os, prev_is):
+    db_path = f'output/db/crossing_{principal_symbol}_dbs/{symbol}.db'
+
+    if not os.path.exists(db_path):
         create_db(f'crossing_{principal_symbol}_dbs/{symbol}')
-    list_files = os.listdir(f'output/crossing_{principal_symbol}/{symbol}/extrac')
-    amount_file = len(list_files)
-    MAX_PROCESOS = 1  # Puedes ajustar este número según tu CPU
-    futures = []
-    
-    with ProcessPoolExecutor(max_workers=MAX_PROCESOS, initializer=init_worker) as executor:
-        for file in list_files:
-            future = executor.submit(procesar_archivo, file, config['max_depth'], symbol, action, NumMaxOperations, cont, list_symbol, amount_file, aumentar_tree, aumentar_profundidad)
-            futures.append(future)
 
+    list_files = os.listdir(
+        f'output/crossing_{principal_symbol}/{symbol}/extrac'
+    )
+    
+    porcent_aumento_os =calcular_porcentage(symbol, prev_os)
+    porcent_aumento_is =calcular_porcentage(symbol, prev_is)
+    
+    MAX_PROCESOS = len(list_files) # ajustable según CPU
+    if MAX_PROCESOS > 25:
+        MAX_PROCESOS = 25
+    
+    with ProcessPoolExecutor(
+        max_workers=MAX_PROCESOS,
+    ) as executor:
+
+        for file in list_files:
+            executor.submit(
+                procesar_archivo,
+                file,
+                symbol,
+                action,
+                NumMaxOperations,
+                cont,
+                list_symbol,
+                prev_os,
+                prev_is,
+                porcent_aumento_os,
+                porcent_aumento_is
+            )
+
+    # Nodo final de cierre
     db_query.insertar_nodo_con_registros(
         name=f'crossing_{principal_symbol}_dbs/{symbol}',
         label='END',
-        file_in_db= '001maco',
-        conditions= 'APO > 2',
-        correct_percentage= 0.53,
-        successful_operations= 251,
-        total_operations= 491,
-        correct_percentage_os= 0.53,
-        successful_operations_os= 251,
-        total_operations_os= 491,
+        file_in_db='001maco',
+        conditions='APO > 2',
+        correct_percentage=0.53,
+        successful_operations=251,
+        total_operations=491,
+        correct_percentage_os=0.53,
+        successful_operations_os=251,
+        total_operations_os=491,
         fechas=[''],
         veneficios=[0],
         fechas_os=[''],
@@ -497,55 +493,65 @@ def create_trees(symbol, action, NumMaxOperations, cont, list_symbol, aumentar_t
     )
     
 
+
 def execute_crossing_builder(action):
-        
     cont = 0
     prosedio = True
     NumMaxOperations = NumMax_Operations
-    list_symbol_lost = []
-    aumentar_tree = 0
-    aumentar_profundidad = 0    
+    
+    
     while cont < len(list_symbol):
         symbol = list_symbol[cont]
-        if prosedio:
-            cont_symbol = len(list_symbol)-cont
-            total_dismin = calcular_descuento(NumMaxOperations, min_operaciones, cont_symbol)
-            print(f'se descuenta {total_dismin} a {NumMaxOperations} por tener {cont_symbol} simbolos restantes')
-            NumMaxOperations -= NumMaxOperations * total_dismin
-            
-        if symbol in list_symbol_lost:
-            cantidad = list_symbol_lost.count(symbol)
-            aumentar_tree = aumento_arboles * cantidad
-            aumentar_profundidad = aumento_profundidad * cantidad
-        create_trees(symbol, action, NumMaxOperations, cont, list_symbol, aumentar_tree, aumentar_profundidad)
 
-        operations = db_query.sum_successful_operations(f'crossing_{principal_symbol}_dbs/{symbol}', action)
-        if operations < NumMaxOperations:
-            print(list_symbol)
-            list_symbol.pop(cont)
-            cantidad = list_symbol_lost.count(symbol)
-            if cantidad < intentos:
-                list_symbol.append(symbol)
-            print(list_symbol)
-            print("Iteracion fallida---------------")
-            list_symbol_lost.append(symbol)
-            db_query.delete_nodes_by_label(f'crossing_{principal_symbol}_dbs/{symbol}', action)
-            prosedio = False
-        else:
-            cont +=1
-            prosedio = True
-            with open(f'config/list_{action}.json', 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            list_sym = data["list"]
-            list_sym.append(symbol)
-            with open(f'config/list_{action}.json', 'w', encoding='utf-8') as f:
-                json.dump({"list": list_sym}, f, indent=4)
-            
-        with open(f'config/three_cont_{action}.json', 'w', encoding='utf-8') as f:
-            json.dump({"cont": 0}, f, indent=4)
-        print(NumMaxOperations)
+        with open(f'config/list_{action}.json', 'r', encoding='utf-8') as file:
+            list_symbol_hechos = json.load(file)
+         
+        prev_is = (
+            db_query.promedio_correct_percentage(principal_symbol, action, 'is')
+            if cont == 0 else
+            db_query.promedio_correct_percentage(
+                f'crossing_{principal_symbol}_dbs/{list_symbol_hechos["list"][-1]}', action, 'is')
+        )
         
+        prev_os = (
+            db_query.promedio_correct_percentage(principal_symbol, action, 'os')
+            if cont == 0 else
+            db_query.promedio_correct_percentage(
+                f"crossing_{principal_symbol}_dbs/{list_symbol_hechos['list'][-1]}", action, 'os'
+            )
+        )
+        
+        print(prev_os, prev_is, '---------')
+        if prosedio:
+            cont_symbol = len(list_symbol) - cont
+            total_dismin = calcular_descuento(
+                NumMaxOperations,
+                min_operaciones,
+                cont_symbol
+            )
 
+            print(
+                f"Se descuenta {total_dismin:.4f} "
+                f" {NumMaxOperations} "
+                f"por tener {cont_symbol} símbolos restantes"
+            )
+
+            NumMaxOperations -= NumMaxOperations * total_dismin
+
+        create_trees(symbol, action, NumMaxOperations, cont, list_symbol, prev_os, prev_is)
+        cont += 1
+        prosedio = True
+
+        with open(f'config/list_{action}.json', 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        list_sym = data["list"]
+        list_sym.append(symbol)
+
+        with open(f'config/list_{action}.json', 'w', encoding='utf-8') as f:
+            json.dump({"list": list_sym},f,indent=4)
+            
+        print("NumMaxOperations actual:", NumMaxOperations)
 
 
 
@@ -562,10 +568,7 @@ if __name__ == "__main__":
     peticiones.initialize_mt5()
     tim.sleep(3)
     
-    extract_data_crossing()
-    select_symbols_correl()
-    extract_indicadores()
-    create_erff(list_symbol, principal_symbol)
+    extract_indicadores()#------------------------------------
     
      # Crear y ejecutar procesos para 'UP' y 'DOWN'
     
@@ -583,7 +586,7 @@ if __name__ == "__main__":
         json.dump({"state": "stopped"}, f, indent=4)
     print("Ambos procesos han terminado.")
     
-    print(f"Tiempo de creación de archivos ARFF: {tim.time() - inicio:.4f} segundos")
+    print(f"Tiempo de creación: {tim.time() - inicio:.4f} segundos")
        
         
   

@@ -4,6 +4,14 @@
         "USDCHF",
         "USDNOK",
         "GBPUSD",
-        "AUDUSD"
+        "AUDUSD",
+        "EURJPY",
+        "NZDUSD",
+        "EURCAD",
+        "EURTRY",
+        "USDCAD",
+        "EURCHF",
+        "USDJPY",
+        "CHFJPY"
     ]
 }

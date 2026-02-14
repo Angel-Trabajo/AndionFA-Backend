@@ -360,7 +360,7 @@ async def execute_crossing():
     extract_data_crossing()
     select_symbols_correl()   
      
-    script_path = Path(__file__).resolve().parent.parent / "utils" / "crossing_builder_mic_randon.py"
+    script_path = Path(__file__).resolve().parent.parent / "utils" / "crossing_builder_cpu.py"
     process2 = subprocess.Popen(
         [sys.executable, str(script_path)],
         stdout=None,   # hereda consola

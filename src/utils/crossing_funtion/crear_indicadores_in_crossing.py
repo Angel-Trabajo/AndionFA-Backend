@@ -47,7 +47,7 @@ def extract_indicadores():
         
         list_files = os.listdir(f'output/extrac')
         indicators_files = [file.split('_')[0]+'.csv' for file in list_files]
-        
+        print(f"Procesando {sym}...")
         # Procesar EN PARALELO ambos folders
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             future1 = executor.submit(create_files_fast, sym, timeframe, 
@@ -288,9 +288,10 @@ def _generate_files_fast(indicator_file, pos, symbol, start, end, timeframe, fol
     output_df = output_df.reset_index(drop=True)
     
     # Guardar archivo
-    name_f = f'_{symbol}_{start.replace("-", "")}_{end.replace("-", "")}_timeframe{timeframe}.csv'
+    name_f = f'_{symbol}_{start.replace("-", "")}_{end.replace("-", "")}_timeframe{timeframe}.parquet'
     output_path = f'output/crossing_{principal_symbol}/{symbol}/{folder}/{indicator_file.replace(".csv", name_f)}'
-    output_df.to_csv(output_path, index=False)
+    output_df.to_parquet(output_path, index=False, engine='pyarrow', compression='snappy')
+
 
 def _buscar_fecha_o_siguiente_fast(df, fecha_objetivo):
     """Versión RÁPIDA de búsqueda de fecha"""
