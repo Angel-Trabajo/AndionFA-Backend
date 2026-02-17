@@ -9,6 +9,8 @@ import sqlite3
 import ast
 import operator
 import pandas as pd
+import time
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 
 
@@ -134,10 +136,14 @@ def get_operation_open(principal_symbol, last_symbol, algorithm):
 
     return list_orders
 
-# ================================
-#   Generación de dataset neuronal
-# ================================
-def data_for_neuronal(algorithm, principal_symbol):
+
+
+def data_for_neuronal(algorithm, principal_symbol, intervalo, df_primitiva, indicadores_dict):
+
+    print("\n==============================")
+    print("INICIO data_for_neuronal DEBUG")
+    print("==============================")
+
     # Cargar config
     with open('config/list_{}.json'.format(algorithm), 'r') as f:
         last_symbol = json.load(f)['list'][-1]
@@ -157,31 +163,6 @@ def data_for_neuronal(algorithm, principal_symbol):
         print("⚠ No hay operaciones abiertas.")
         return
 
-    # Dataset primitivo
-    df_is = pd.read_csv('output/is_os/is.csv')
-    df_os = pd.read_csv('output/is_os/os.csv')
-    df_primitiva = (
-        pd.concat([df_is, df_os], ignore_index=True)
-        .drop_duplicates(subset=['time'])
-        .sort_values(by='time', ignore_index=True)
-    )
-    df_primitiva["time"] = pd.to_datetime(df_primitiva["time"])
-    # Cargar indicadores
-    list_files_is = os.listdir('output/extrac/')
-    list_files_os = os.listdir('output/extrac_os/')
-    indicadores_dict = {}
-
-    for name_is, name_os in zip(list_files_is, list_files_os):
-        df1 = pd.read_parquet(f'output/extrac/{name_is}')
-        df2 = pd.read_parquet(f'output/extrac_os/{name_os}')
-        df = pd.concat([df1, df2], ignore_index=True).drop_duplicates(subset=['time'])
-
-        # 🔽 MEJORA 2: evitar leakage de indicadores
-        df = df.sort_values("time").reset_index(drop=True)
-        df.iloc[:, 1:] = df.iloc[:, 1:].shift(1)  # "time" es la primera columna
-
-        indicadores_dict[name_is] = df
-
     list_codes = []
 
     # Generar dataset neuronal
@@ -200,7 +181,7 @@ def data_for_neuronal(algorithm, principal_symbol):
             continue
         idx = idxs[0]
 
-        rest = df_primitiva.iloc[idx + 1: idx + 20].copy()
+        rest = df_primitiva.iloc[idx + 1: idx + intervalo].copy()
         if rest.empty:
             continue
 
@@ -237,9 +218,7 @@ def data_for_neuronal(algorithm, principal_symbol):
     df.to_csv(path, index=False)
     print(f"✅ Dataset neuronal generado: {path}")
 
-# ================================
-#   Limpieza — Opción A (mayoría)
-# ================================
+
 def clean_majority(algorithm, principal_symbol):
     path = f"src/neuronal/data/data_{algorithm}_{principal_symbol}.csv"
 
@@ -266,19 +245,31 @@ def clean_majority(algorithm, principal_symbol):
     print(f"✅ Datos limpiados por mayoría: {out}")
     return cleaned
 
-# ================================
-#   MAIN PIPELINE
-# ================================
-if __name__ == "__main__":
-    with open('config/config_crossing/config_crossing.json', 'r') as f:
-        config_cross = json.load(f)
-    principal_symbol = config_cross['principal_symbol']
 
-    with open('config/config_test/config_test_red.json', 'r') as f:
-        config_test = json.load(f)
-    algorithm = config_test['algorithm']
+# def clean_majority(algorithm, principal_symbol):
+#     path = f"src/neuronal/data/data_{algorithm}_{principal_symbol}.csv"
 
-    print("🚀 Ejecutando pipeline completo...")
-    data_for_neuronal(algorithm, principal_symbol)
-    clean_majority(algorithm, principal_symbol)
-    print("🎉 Pipeline finalizado.")
+#     data = pd.read_csv(path)
+#     data["input1_t"] = data["input1"].apply(ast.literal_eval).apply(tuple)
+#     data["input2_t"] = data["input2"].apply(ast.literal_eval).apply(tuple)
+
+#     grouped = (
+#         data.groupby(["input1_t", "input2_t"])
+#         .agg(
+#             total=("output", "count"),
+#             positives=("output", "sum")
+#         )
+#         .reset_index()
+#     )
+
+#     # 🔥 PROBABILIDAD REAL
+#     grouped["output"] = round(grouped["positives"] / grouped["total"], 1)
+
+#     # Filtrar muy pocos ejemplos
+#     grouped = grouped[grouped["total"] >= 5]
+
+#     out = f"src/neuronal/data/data_cleaned_{algorithm}_{principal_symbol}.csv"
+#     grouped[["input1_t", "input2_t", "output"]].to_csv(out, index=False)
+
+#     print(f"✅ Datos limpiados con probabilidad: {out}")
+#     return grouped

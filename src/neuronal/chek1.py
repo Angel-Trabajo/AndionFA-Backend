@@ -8,11 +8,13 @@ import time
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import pyarrow.parquet as pq
+import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 from src.db.query import get_nodes_by_label
-from src.neuronal.entrenar import load_trained_model, predict_from_inputs
+from src.neuronal.entrenar import load_trained_model, predict_from_inputs, BinaryNN, load_data
+from src.neuronal.data_para_entrenar import data_for_neuronal, clean_majority
 
 print("Starting backtest...")
 
@@ -39,11 +41,6 @@ list_symbols = config_extractor['list']
 principal_symbol = config_crossing['principal_symbol']
 list_symbols.insert(0, principal_symbol)
 
-with open('src/neuronal/data/maping_open.json') as f:
-    encoding_actions = json.load(f)
-
-with open('src/neuronal/data/maping_close.json') as f:
-    encoding_actions_close = json.load(f)
 
 # ------------------------------------------------------------
 # BASE IS / OS
@@ -52,14 +49,15 @@ with open('src/neuronal/data/maping_close.json') as f:
 df_is = pd.read_csv('output/is_os/is.csv')
 df_os = pd.read_csv('output/is_os/os.csv')
 
-df_base = (
+df_base1 = (
     pd.concat([df_is, df_os], ignore_index=True)
       .drop_duplicates(subset='time')
 )
 
-df_base['time'] = pd.to_datetime(df_base['time'])
-df_base = df_base[
-    df_base['time'] >= datetime.strptime(config_node['dateStart'], '%Y-%m-%d') - relativedelta(years=4)
+df_base1['time'] = pd.to_datetime(df_base1['time'])
+
+df_base = df_base1[
+    df_base1['time'] >= datetime.strptime(config_node['dateStart'], '%Y-%m-%d') - relativedelta(years=4)
 ]
 
 df_base = df_base.sort_values('time').set_index('time')
@@ -237,109 +235,136 @@ print("Archivos cargados:", len(DATA_CACHE))
 # RED NEURONAL
 # ------------------------------------------------------------
 
+indicadores_dict = {}
+
+list_files_is = os.listdir('output/extrac/')
+list_files_os = os.listdir('output/extrac_os/')
+
+for name_is, name_os in zip(list_files_is, list_files_os):
+
+    df1 = pd.read_parquet(f'output/extrac/{name_is}')
+    df2 = pd.read_parquet(f'output/extrac_os/{name_os}')
+
+    df = pd.concat([df1, df2], ignore_index=True).drop_duplicates(subset=['time'])
+
+    df["time"] = pd.to_datetime(df["time"])
+    df = df.sort_values("time").reset_index(drop=True)
+
+    # evitar leakage
+    df.iloc[:, 1:] = df.iloc[:, 1:].shift(1)
+
+    df = df.set_index("time")
+
+    indicadores_dict[name_is] = df
+
+print("Indicadores cargados:", len(indicadores_dict))
+
+pips_mas_alto = 0.0
+bynary_best = {}
+
+list_intervalos = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60]
+for interval in list_intervalos:
+    
+
+    ini1 = time.time()
+    data_for_neuronal(algorithm, principal_symbol, 30, df_base1, indicadores_dict)
+    print(f"Dataset para neuronal generado en {time.time() - ini1:.2f} segundos.")
+    clean_majority(algorithm, principal_symbol)
+
+
+    X, Y = load_data("src/neuronal/data/data_cleaned_UP_EURUSD.csv")
+    print("Datos cargados:", X.shape)
+
+    nn = BinaryNN(input_dim=X.shape[1], lr=0.01, target_loss=0.01)
+    nn.fit(X, Y, epochs=20000, batch_size=32)
+
+    preds = nn.predict(X)
+    acc = (preds.reshape(-1) == Y.reshape(-1)).mean() * 100
+    print(f"\nAccuracy final: {acc:.2f}%")
+
+    # ------------ GUARDAR EL MODELO ------------
+    model = {
+        'W1': nn.W1.tolist(), 'b1': nn.b1.tolist(),
+        'W2': nn.W2.tolist(), 'b2': nn.b2.tolist(),
+        'W3': nn.W3.tolist(), 'b3': nn.b3.tolist(),
+        'W4': nn.W4.tolist(), 'b4': nn.b4.tolist(),
+    }
+
+    with open("src/neuronal/data/nn_binary_best.json", "w") as f:
+        json.dump(model, f, indent=2)
+
+    time.sleep(2)  # pequeño descanso antes del backtest
 
 
 
 
+    with open('src/neuronal/data/maping_open.json') as f:
+        encoding_actions = json.load(f)
 
-
-nn = load_trained_model(
-    "src/neuronal/data/nn_binary_best.json",
-    input_dim=18
-)
-
-
+    with open('src/neuronal/data/maping_close.json') as f:
+        encoding_actions_close = json.load(f)
 
 
 
-# ------------------------------------------------------------
-# DEBUG RANGO BASE
-# ------------------------------------------------------------
+    nn = load_trained_model(
+        "src/neuronal/data/nn_binary_best.json",
+        input_dim=18
+    )
+   
+    # ------------------------------------------------------------
+    # LOOP PRINCIPAL
+    # ------------------------------------------------------------
 
-print("RANGO df_base:")
-print("Inicio:", df_base.index.min())
-print("Fin:", df_base.index.max())
-print("Total filas:", len(df_base))
-print("-" * 50)
+    is_open = False
+    open_price_open = 0.0
+    sum_pips = 0.0
+    entry_red = ()
+    cierre = 0
 
+    cantidad_operaciones = 0
+    operaciones_acertadas = 0
+    operaciones_perdedoras = 0
 
-# ------------------------------------------------------------
-# CONTADORES DEBUG
-# ------------------------------------------------------------
+    ganancia_bruta = 0.0
+    perdida_bruta = 0.0
 
-opens_condicion_por_anio = {}
-closes_condicion_por_anio = {}
-nn_aprueba_por_anio = {}
-operaciones_reales_por_anio = {}
+    lista_pips = []  # para pseudo-sharpe
+    
+    for row in df_base.itertuples():
 
+        time_actual = row.Index
+        open_price = row.open
 
-# ------------------------------------------------------------
-# LOOP PRINCIPAL
-# ------------------------------------------------------------
+        # =========================================================
+        # CIERRE
+        # =========================================================
+        if is_open:
+            cierre += 1
+            if cierre >= (interval if interval >=50 else 50):
+                print(f"Cierre forzado por tiempo: {time_actual} - Intervalo: {interval} - Cierre count: {cierre}") 
+                is_open = False
+                cantidad_operaciones += 1
 
-is_open = False
-open_price_open = 0.0
-sum_pips = 0.0
-entry_red = ()
+                if algorithm == 'UP':
+                    trade_pips = open_price - open_price_open
+                else:
+                    trade_pips = open_price_open - open_price
 
-for row in df_base.itertuples():
+                sum_pips += trade_pips
+                lista_pips.append(trade_pips)
 
-    time_actual = row.Index
-    open_price = row.open
+                if trade_pips > 0:
+                    operaciones_acertadas += 1
+                    ganancia_bruta += trade_pips
+                else:
+                    operaciones_perdedoras += 1
+                    perdida_bruta += abs(trade_pips)
 
-    # =========================================================
-    # CIERRE
-    # =========================================================
-    if is_open:
-
-        for nodo in nodos_close:
-
-            df_struct = COMBINED[("close", nodo["file"])]
-            df = df_struct["df"]
-
-            pos = df.index.searchsorted(time_actual)
-            if pos == 0:
+                print(f"Cierre forzado por tiempo en {time_actual}")
                 continue
+            for nodo in nodos_close:
 
-            if cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
-
-                # DEBUG condiciones close
-                anio = time_actual.year
-                closes_condicion_por_anio[anio] = closes_condicion_por_anio.get(anio, 0) + 1
-
-                entry_red_close = tuple(encoding_actions_close[nodo["key"]])
-                clase, _ = predict_from_inputs(nn, entry_red, entry_red_close)
-
-                if clase == 1:
-
-                    # DEBUG red aprueba
-                    nn_aprueba_por_anio[anio] = nn_aprueba_por_anio.get(anio, 0) + 1
-
-                    is_open = False
-
-                    if algorithm == 'UP':
-                        sum_pips += open_price - open_price_open
-                    else:
-                        sum_pips += open_price_open - open_price
-
-                    # DEBUG operación real
-                    operaciones_reales_por_anio[anio] = operaciones_reales_por_anio.get(anio, 0) + 1
-
-                    print(f"SUM PIPS: {time_actual}: {sum_pips} => {open_price_open}-{open_price} = {open_price_open - open_price}")
-                    break
-
-    # =========================================================
-    # APERTURA
-    # =========================================================
-    else:
-
-        for symbol in list_symbols:
-
-            cumple_alguno = False
-
-            for nodo in dict_nodos[symbol]:
-
-                df_struct = COMBINED[("open", symbol, nodo["file"])]
+                df_struct = COMBINED[("close", nodo["file"])]
                 df = df_struct["df"]
 
                 pos = df.index.searchsorted(time_actual)
@@ -348,41 +373,106 @@ for row in df_base.itertuples():
 
                 if cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
 
-                    # DEBUG condiciones open
-                    anio = time_actual.year
-                    opens_condicion_por_anio[anio] = opens_condicion_por_anio.get(anio, 0) + 1
+        
+                    entry_red_close = tuple(encoding_actions_close[nodo["key"]])
+                    clase, _ = predict_from_inputs(nn, entry_red, entry_red_close)
+                    if clase == 1: 
+                        is_open = False
+                        cantidad_operaciones += 1
 
-                    cumple_alguno = True
+                        if algorithm == 'UP':
+                            trade_pips = open_price - open_price_open
+                        else:
+                            trade_pips = open_price_open - open_price
 
-                    if symbol == list_symbols[-1]:
-                        entry_red = tuple(encoding_actions[nodo["key"]])
-                        open_price_open = open_price
-                        is_open = True
+                        sum_pips += trade_pips
+                        lista_pips.append(trade_pips)
 
+                        if trade_pips > 0:
+                            operaciones_acertadas += 1
+                            ganancia_bruta += trade_pips
+                        else:
+                            operaciones_perdedoras += 1
+                            perdida_bruta += abs(trade_pips)
+
+                        print(f"SUM PIPS: {time_actual}: {sum_pips}")
+                        break
+
+        # =========================================================
+        # APERTURA
+        # =========================================================
+        else:
+            cierre = 0
+            for symbol in list_symbols:
+
+                cumple_alguno = False
+
+                for nodo in dict_nodos[symbol]:
+
+                    df_struct = COMBINED[("open", symbol, nodo["file"])]
+                    df = df_struct["df"]
+
+                    pos = df.index.searchsorted(time_actual)
+                    if pos == 0:
+                        continue
+
+                    if cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
+
+                        cumple_alguno = True
+
+                        if symbol == list_symbols[-1]:
+                            entry_red = tuple(encoding_actions[nodo["key"]])
+                            open_price_open = open_price
+                            is_open = True
+
+                        break
+
+                if not cumple_alguno:
                     break
+    winrate = (operaciones_acertadas / cantidad_operaciones) if cantidad_operaciones > 0 else 0.0
 
-            if not cumple_alguno:
-                break
+    profit_factor = (
+        ganancia_bruta / perdida_bruta
+        if perdida_bruta > 0 else 0
+    )
 
+    avg_win = ganancia_bruta / operaciones_acertadas if operaciones_acertadas > 0 else 0
+    avg_loss = perdida_bruta / operaciones_perdedoras if operaciones_perdedoras > 0 else 0
 
+    expectancy = (winrate * avg_win) - ((1 - winrate) * avg_loss)
+
+    # Pseudo Sharpe sobre pips
+    if len(lista_pips) > 1 and np.std(lista_pips) != 0:
+        sharpe = np.mean(lista_pips) / np.std(lista_pips)
+    else:
+        sharpe = 0
+
+    print(f"""
+    Operaciones: {cantidad_operaciones}
+    Winrate: {winrate*100:.2f}%
+    Profit Factor: {profit_factor:.2f}
+    Expectancy: {expectancy:.4f}
+    Sharpe (pips): {sharpe:.4f}
+    Pips Totales: {sum_pips:.2f}
+    """)
+    
+    # Penalización por pocas operaciones
+    penalizacion = np.log(cantidad_operaciones + 1)
+
+    score = (
+        0.35 * sharpe +
+        0.25 * profit_factor +
+        0.20 * winrate +
+        0.20 * (sum_pips / 1000)
+    ) * penalizacion
+    if score > pips_mas_alto:
+        pips_mas_alto = score
+        bynary_best = model
+        print(f"🏆 Nuevo mejor modelo en intervalo {interval}")
+
+with open("src/neuronal/data/nn_binary_best.json", "w") as f:
+        json.dump(bynary_best, f, indent=2)
 # ------------------------------------------------------------
 # RESUMEN FINAL DEBUG
 # ------------------------------------------------------------
 
-print("\n" + "="*60)
-print("DEBUG ESTADÍSTICAS POR AÑO")
-print("="*60)
-
-print("OPEN condiciones por año:")
-print(opens_condicion_por_anio)
-
-print("\nCLOSE condiciones por año:")
-print(closes_condicion_por_anio)
-
-print("\nRed devuelve clase 1 por año:")
-print(nn_aprueba_por_anio)
-
-print("\nOperaciones reales ejecutadas por año:")
-print(operaciones_reales_por_anio)
-
-print("="*60)

@@ -6,6 +6,7 @@ import sys
 import operator
 import json
 import ast
+import shutil
 
 
 
@@ -177,7 +178,7 @@ def generate_files(indicator_file, df):
             timeperiod = int(line[1].split(',')[1])
             nbdev = float(line[1].split(',')[2])
             result = talib.STDDEV(real, timeperiod=timeperiod, nbdev=nbdev)
-            data[f'STDDEV_{timeperiod}_{str(nbdev).replace('.', '')}'] = result
+            data[f"STDDEV_{timeperiod}_{str(nbdev).replace('.', '')}"] = result
             
         elif indicator_name == 'STOCHF':
             params = line[1].split(',')
@@ -237,7 +238,7 @@ def generate_files(indicator_file, df):
             timeperiod = int(line[1].split(',')[1])
             nbdev = float(line[1].split(',')[2])
             result = talib.VAR(real, timeperiod=timeperiod, nbdev=nbdev)
-            data[f'VAR_{timeperiod}_{str(nbdev).replace('.','')}'] = result
+            data[f"VAR_{timeperiod}_{str(nbdev).replace('.','')}"] = result
             
         elif indicator_name == 'WILLR':
             timeperiod = int(line[1].split(',')[-1])
@@ -315,8 +316,7 @@ def obtener_ultimas_velas(symbol: str, fecha_str: str, timeframe: str, cont):
     # --- Descargar las últimas 830 velas antes de la fecha final ---
     cantidad = 1
     if cont == 1:
-        cantidad = 830
-        
+        cantidad = 830  
     rates = peticiones.get_data_by_days(symbol, tf, fecha_final, cantidad)
     if rates is None or len(rates) == 0:
         raise ValueError("⚠️ No se obtuvieron datos del terminal MT5")
@@ -343,8 +343,8 @@ with open('config/config_test/config_test_red.json', 'r') as file:
     config = json.load(file)
 algorithm = config['algorithm']
 
-list_files_name = os.listdir('output/data_arff/')
-list_files_name = [f'{file.split('_')[0]}.csv' for file in list_files_name ]
+list_files_name = os.listdir('output/extrac/')
+list_files_name = [f"{file.split('_')[0]}.csv" for file in list_files_name ]
 
 with open(f'config/list_{algorithm}.json', 'r') as file:
     config_extractor = json.load(file)
@@ -444,10 +444,22 @@ def procesar_symbol(symbol, date, list_files_name, cont):
 
     return symbol
 
+def limpiar_carpeta(ruta_carpeta):
+    if os.path.exists(ruta_carpeta):
+        for nombre in os.listdir(ruta_carpeta):
+            ruta_elemento = os.path.join(ruta_carpeta, nombre)
+            if os.path.isfile(ruta_elemento) or os.path.islink(ruta_elemento):
+                os.unlink(ruta_elemento)  # elimina archivo o enlace simbólico
+            elif os.path.isdir(ruta_elemento):
+                shutil.rmtree(ruta_elemento)  # elimina carpeta recursivamente
+        print(f"Contenido de la carpeta '{ruta_carpeta}' eliminado correctamente.")
+    else:
+        print(f"La carpeta '{ruta_carpeta}' no existe.")
 
 
 #--------------------------------------------------------------------------------------------------------------
 if __name__ == "__main__":
+    limpiar_carpeta('output/test_neuronal/')
     peticiones.initialize_mt5()
     context = zmq.Context()
     socket = context.socket(zmq.REP)
@@ -461,8 +473,7 @@ if __name__ == "__main__":
         encoding_actions = json.load(file)
      
     while True:
-        cont += 1
-        dict_files.clear() 
+        cont += 1 
         message = socket.recv_string()
         print("Recibido de MT5:", message)
 
@@ -494,7 +505,7 @@ if __name__ == "__main__":
                     entry_red_close = tuple(entry_red_close)
                     clase, valor = predict_from_inputs(nn, entry_red, entry_red_close)
                     
-                    if (clase == 1) or (i > 10 and open_price > open_price_open):
+                    if (clase == 1):
                         order = 'CLOSE'
                         is_open = False
                         break
@@ -554,6 +565,7 @@ if __name__ == "__main__":
         print("→ Enviando orden:", order)
 
         socket.send_string(order)
+        dict_files.clear()
         if cont > 1:
             for symbol in list_symbols:
                 try:
