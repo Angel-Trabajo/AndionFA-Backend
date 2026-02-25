@@ -179,32 +179,90 @@ def load_trained_model(json_file, input_dim, lr=0.01):
 # # PREDICCIÓN DESDE INPUTS
 # ----------------------------------------------------------
 def predict_from_inputs(nn, input1, input2):
-    a = np.array(input1, dtype=np.float32)
-    b = np.array(input2, dtype=np.float32)
 
-    X = np.concatenate([a, b]).reshape(1, -1)
+    # Asegurar que sean strings
+    input1 = str(input1).zfill(7)
+    input2 = str(input2).zfill(6)
+
+    # Convertir cada carácter en bit
+    a = np.array([int(bit) for bit in input1], dtype=np.float32)
+    b = np.array([int(bit) for bit in input2], dtype=np.float32)
+
+    # Unir
+    X = np.concatenate((a, b)).reshape(1, -1)
+
     pred = nn.forward(X)[0][0]
 
-    return int(pred >= 0.5), pred
+    return int(pred >= 0.5), float(pred)
 
 # ----------------------------------------------------------
 # CARGA DE DATOS
 # ----------------------------------------------------------
 def load_data(csv_file):
-    df = pd.read_csv(csv_file)
+    # Forzar lectura como string
+    df = pd.read_csv(csv_file, dtype=str)
 
-    X_list, Y_list = [], []
+    X_list = []
+    Y_list = []
 
     for _, row in df.iterrows():
-        a = np.fromstring(row.iloc[0].strip("()"), sep=',')
-        b = np.fromstring(row.iloc[1].strip("()"), sep=',')
-        y = float(row.iloc[2])
+        input1 = row["input1"].strip()
+        input2 = row["input2"].strip()
+        y = float(row["output"])
+
+        # Convertir string binario a vector de bits
+        a = np.array([int(bit) for bit in input1], dtype=np.float32)
+        b = np.array([int(bit) for bit in input2], dtype=np.float32)
 
         X_list.append(np.concatenate([a, b]))
         Y_list.append(y)
 
-    X = np.vstack(X_list).astype(np.float32)
-    Y = np.array(Y_list).reshape(-1,1).astype(np.float32)
+    X = np.vstack(X_list)
+    Y = np.array(Y_list).reshape(-1, 1).astype(np.float32)
 
     return X, Y
+  
+    
+    
+if __name__ == "__main__":
+    
+    with open('config/config_test/config_test_red.json', 'r') as file:
+        config = json.load(file)
+    algorithm = config['algorithm']
+    with open('config/config_crossing/config_crossing.json', 'r') as file:
+        config_crossing = json.load(file)
+        
+    path = f'src/neuronal/data/data_for_neuronal_{algorithm}_{config_crossing["principal_symbol"]}.csv'
+    
+    X, Y = load_data(path)
+    print("Datos cargados:")
+    print("X shape:", X.shape)
+    print("Y shape:", Y.shape)
+    nn = BinaryNN(input_dim=X.shape[1], lr=0.01, target_loss=0.10)
+    nn.fit(X, Y, epochs=20000, batch_size=32)
+    # Guardar modelo entrenado
+    model_data = {
+        'W1': nn.W1.tolist(),
+        'b1': nn.b1.tolist(),
+        'W2': nn.W2.tolist(),
+        'b2': nn.b2.tolist(),
+        'W3': nn.W3.tolist(),
+        'b3': nn.b3.tolist(),
+        'W4': nn.W4.tolist(),
+        'b4': nn.b4.tolist()
+    }
+    with open('src/neuronal/data/model_trained.json', 'w') as f:
+        json.dump(model_data, f, indent=4)
+    print("Modelo entrenado guardado en 'src/neuronal/data/model_trained.json'")
+    
+    # Ejemplo de predicción
+    # 7 + 6
 
+    nn = load_trained_model(
+        "src/neuronal/data/model_trained.json",
+        input_dim=X.shape[1]
+    )
+
+    clase, prob = predict_from_inputs(nn, "0000101", "001011")
+
+    print(clase, prob)

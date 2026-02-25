@@ -13,267 +13,14 @@ import shutil
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
  
 from src.routes import peticiones
-import numpy as np
-import talib
 from src.db.query import get_nodes_by_label
-from src.neuronal.entrenar import load_trained_model, predict_from_inputs
+from src.neuronal.entrenar import load_trained_model, load_data, predict_from_inputs, BinaryNN
+from src.neuronal.backtester import Backtester
+from src.neuronal.data_para_entrenar import data_for_neuronal
+from src.neuronal.generar_indicadores_for_neuro_test import generate_files
+
 
 dict_files = {}
-
-def generate_files(indicator_file, df):
-    with open(f'config/extractor/{indicator_file}', 'r') as f:
-        raw_lines = f.readlines()
-    
-    price_column_map = {
-        '[[CLOSE_PRICE]]': 'close',
-        '[[HIGH_PRICE]]': 'high',
-        '[[LOW_PRICE]]': 'low'
-    }
-    
-    data = {
-        'time': df['time'].to_numpy(dtype='datetime64[ns]'),
-    }    
-    
-    high = df['high'].to_numpy(dtype=np.float64)
-    low = df['low'].to_numpy(dtype=np.float64)
-    close = df['close'].to_numpy(dtype=np.float64)
-    
-    for line in raw_lines:
-        line = line.strip().split(';')
-        indicator_name = line[0]
-        
-        if indicator_name == 'ADX':
-            timeperiod = int(line[1].split(',')[-1])
-            result = talib.ADX(high, low, close, timeperiod=timeperiod)
-            data[f'ADX_{timeperiod}'] = result
-            
-        elif indicator_name == 'ADXR':
-            timeperiod = int(line[1].split(',')[-1])
-            result = talib.ADXR(high, low, close, timeperiod=timeperiod)
-            data[f'ADXR_{timeperiod}'] = result
-            
-        elif indicator_name == 'APO':
-            params = line[1].split(',')
-            colum = price_column_map[params[0]]
-            real = df[colum].to_numpy(dtype=np.float64)
-            fast = int(params[1])
-            slow = int(params[2])
-            value3 = params[3].replace('[', '').replace(']', '').strip()
-            matype = replaceString[value3]
-            result = talib.APO(real, fast, slow, matype)
-            data[f'APO_{fast}_{slow}_{value3}'] = result
-
-        elif indicator_name == 'AROON':
-            params = line[1].split(',')
-            timeperiod = int(params[2])
-            pos_output = 0
-            if params[3] == '[[OUTPUT2]]':
-                pos_output = 1
-            result = talib.AROON(high, low, timeperiod=timeperiod)[pos_output]
-            data[f'AROON_{timeperiod}_pos{pos_output}'] = result
-
-        elif indicator_name == 'ATR':
-            timeperiod = int(line[1].split(',')[-1])
-            result = talib.ATR(high, low, close, timeperiod=timeperiod)
-            data[f'ATR_{timeperiod}'] = result
-            
-        elif indicator_name == 'BOP':
-            colum_open = df['open'].to_numpy(dtype=np.float64)
-            result = talib.BOP(colum_open, high, low, close)
-            data['BOP'] = result
-            
-        elif indicator_name == 'CCI':
-            timeperiod = int(line[1].split(',')[-1])
-            result = talib.CCI(high, low, close, timeperiod=timeperiod)
-            data[f'CCI_{timeperiod}'] = result
-            
-        elif indicator_name == 'CMO':
-            colum = price_column_map[line[1].split(',')[0]]
-            real = df[colum].to_numpy(dtype=np.float64)
-            timeperiod = int(line[1].split(',')[-1])
-            result = talib.CMO(real, timeperiod=timeperiod)
-            data[f'CMO_{timeperiod}'] = result
-        
-        elif indicator_name == 'DX':
-            timeperiod = int(line[1].split(',')[-1])
-            result = talib.DX(high, low, close, timeperiod=timeperiod)
-            data[f'DX_{timeperiod}'] = result
-            
-        elif indicator_name == 'MACD':
-            params = line[1].split(',')
-            colum = price_column_map[params[0]]
-            real = df[colum].to_numpy(dtype=np.float64)
-            fastperiod = int(params[1])
-            slowperiod = int(params[2])
-            signalperiod = int(params[3])
-            result_pos = 0
-            if params[4] == '[[OUTPUT2]]':
-                result_pos= 1
-            elif params[4] == '[[OUTPUT3]]':
-                result_pos = 2
-            result = talib.MACD(real, fastperiod=fastperiod, slowperiod=slowperiod, signalperiod=signalperiod)[result_pos]
-            data[f'MACD_{fastperiod}_{slowperiod}_{signalperiod}_pos{result_pos}'] = result
-            
-        elif indicator_name == 'MINUS_DI':
-            timeperiod = int(line[1].split(',')[-1])
-            result = talib.MINUS_DI(high, low, close, timeperiod=timeperiod)
-            data[f'MINUS_DI_{timeperiod}'] = result
-            
-        elif indicator_name == 'MINUS_DM':
-            timeperiod = int(line[1].split(',')[-1])
-            result = talib.MINUS_DM(high, low, timeperiod=timeperiod)
-            data[f'MINUS_DM_{timeperiod}'] = result
-            
-        elif indicator_name == 'MOM':
-            colum = price_column_map[line[1].split(',')[0]]
-            real = df[colum].to_numpy(dtype=np.float64)
-            timeperiod = int(line[1].split(',')[-1])
-            result = talib.MOM(real, timeperiod=timeperiod)
-            data[f'MOM_{timeperiod}'] = result
-            
-        elif indicator_name == 'NATR':
-            timeperiod = int(line[1].split(',')[-1])
-            result = talib.NATR(high, low, close, timeperiod=timeperiod)
-            data[f'NATR_{timeperiod}'] = result
-        
-        elif indicator_name == 'PLUS_DI':
-            timeperiod = int(line[1].split(',')[-1])
-            result = talib.PLUS_DI(high, low, close, timeperiod=timeperiod)
-            data[f'PLUS_DI_{timeperiod}'] = result
-        
-        elif indicator_name == 'PLUS_DM':
-            timeperiod = int(line[1].split(',')[-1])
-            result = talib.PLUS_DM(high, low, timeperiod=timeperiod)
-            data[f'PLUS_DM_{timeperiod}'] = result
-            
-        elif indicator_name == 'PPO':
-            params = line[1].split(',')
-            colum = price_column_map[params[0]]
-            real = df[colum].to_numpy(dtype=np.float64)
-            fastperiod = int(params[1])
-            slowperiod = int(params[2])
-            value3 = params[3].replace('[', '').replace(']', '').strip()
-            matype = replaceString[value3]
-            result = talib.PPO(real, fastperiod=fastperiod, slowperiod=slowperiod, matype=matype)
-            data[f'PPO_{fastperiod}_{slowperiod}_{value3}'] = result
-            
-        elif indicator_name == 'ROC':
-            params = line[1].split(',')
-            colum = price_column_map[params[0]]
-            real = df[colum].to_numpy(dtype=np.float64)
-            timeperiod = int(params[1])
-            result = talib.ROC(real, timeperiod=timeperiod)
-            data[f'ROC_{timeperiod}'] = result
-            
-        elif indicator_name == 'RSI':
-            colum = price_column_map[line[1].split(',')[0]]
-            real = df[colum].to_numpy(dtype=np.float64)
-            timeperiod = int(line[1].split(',')[-1])
-            result = talib.RSI(real, timeperiod=timeperiod)
-            data[f'RSI_{timeperiod}'] = result
-         
-        elif indicator_name == 'STDDEV':
-            colum = price_column_map[line[1].split(',')[0]]
-            real = df[colum].to_numpy(dtype=np.float64)
-            timeperiod = int(line[1].split(',')[1])
-            nbdev = float(line[1].split(',')[2])
-            result = talib.STDDEV(real, timeperiod=timeperiod, nbdev=nbdev)
-            data[f"STDDEV_{timeperiod}_{str(nbdev).replace('.', '')}"] = result
-            
-        elif indicator_name == 'STOCHF':
-            params = line[1].split(',')
-            fastk_period = int(params[3])
-            fastd_period = int(params[4])
-            matype = params[5].replace('[', '').replace(']', '').strip()
-            fastd_matype = replaceString[matype]
-            result_pos = 0
-            if params[6] == '[[OUTPUT2]]':
-                result_pos = 1
-            result = talib.STOCHF(high, low, close, fastk_period=fastk_period, fastd_period=fastd_period, fastd_matype=fastd_matype)[result_pos]
-            data[f'STOCHF_{fastk_period}_{fastd_period}_{matype}_pos{result_pos}'] = result
-        
-        elif indicator_name == 'STOCH':
-            params = line[1].split(',')
-            fastk_period = int(params[3])
-            slowk_period = int(params[4])
-            matype1 = params[5].replace('[', '').replace(']', '').strip()
-            slowk_matype = replaceString[matype1]
-            slowd_period = int(params[6])
-            matype2 = params[7].replace('[', '').replace(']', '').strip()
-            slowd_matype = replaceString[matype2]
-            result = talib.STOCH(high, low, close, fastk_period=fastk_period, slowk_period=slowk_period, slowk_matype=slowk_matype, slowd_period=slowd_period, slowd_matype=slowd_matype)[0]
-            data[f'STOCH_{fastk_period}_{slowk_period}_{matype1}_{slowd_period}_{matype2}_pos{0}'] = result
-            result2 = talib.STOCH(high, low, close, fastk_period=fastk_period, slowk_period=slowk_period, slowk_matype=slowk_matype, slowd_period=slowd_period, slowd_matype=slowd_matype)[1]
-            data[f'STOCH_{fastk_period}_{slowk_period}_{matype1}_{slowd_period}_{matype2}_pos{1}'] = result2
-            
-        elif indicator_name == 'STOCHRSI':
-            params = line[1].split(',')
-            colum = price_column_map[params[0]]
-            real = df[colum].to_numpy(dtype=np.float64)
-            timeperiod = int(params[1])
-            fastk_period = int(params[2])
-            fastd_period = int(params[3])
-            matype = params[4].replace('[', '').replace(']', '').strip()
-            fastd_matype = replaceString[matype]
-            result_pos = 0
-            if params[5] == '[[OUTPUT2]]':
-                result_pos = 1
-            result = talib.STOCHRSI(real, timeperiod=timeperiod, fastk_period=fastk_period, fastd_period=fastd_period, fastd_matype=fastd_matype)[result_pos]
-            data[f'STOCHRSI_{timeperiod}_{fastk_period}_{fastd_period}_{matype}_pos{result_pos}'] = result
-
-        elif indicator_name == 'TRANGE':
-            result = talib.TRANGE(high, low, close)
-            data['TRANGE'] = result
-            
-        elif indicator_name == 'ULTOSC':
-            timeperiod1 = int(line[1].split(',')[3])
-            timeperiod2 = int(line[1].split(',')[4])
-            timeperiod3 = int(line[1].split(',')[5])
-            result = talib.ULTOSC(high, low, close, timeperiod1=timeperiod1, timeperiod2=timeperiod2, timeperiod3=timeperiod3)
-            data[f'ULTOSC_{timeperiod1}_{timeperiod2}_{timeperiod3}'] = result
-            
-        elif indicator_name == 'VAR':
-            colum = price_column_map[line[1].split(',')[0]]
-            real = df[colum].to_numpy(dtype=np.float64)
-            timeperiod = int(line[1].split(',')[1])
-            nbdev = float(line[1].split(',')[2])
-            result = talib.VAR(real, timeperiod=timeperiod, nbdev=nbdev)
-            data[f"VAR_{timeperiod}_{str(nbdev).replace('.','')}"] = result
-            
-        elif indicator_name == 'WILLR':
-            timeperiod = int(line[1].split(',')[-1])
-            result = talib.WILLR(high, low, close, timeperiod=timeperiod)
-            data[f'WILLR_{timeperiod}'] = result
-
-    data['open'] = df['open'].to_numpy(dtype=np.float64)
-    data['close'] = df['close'].to_numpy(dtype=np.float64)
-    output_df = pd.DataFrame(data)
-
-    output_df['label'] = np.where(
-        output_df['close'] > output_df['open'], 'UP',
-        np.where(output_df['close'] < output_df['open'], 'DOWN', None)
-    )
-    # Eliminar filas donde label es None (close == open)
-    output_df = output_df[output_df['label'].notna()]
-    # Eliminar columnas 'open' y 'close'
-    output_df = output_df.drop(columns=['open', 'close'])
-    # (Opcional) Resetear el índice si lo deseas
-    output_df = output_df.reset_index(drop=True)
-    return output_df
-
-
-replaceString = {
-    "SMA": 0,
-    "EMA": 1,
-    "WMA": 2,
-    "DEMA": 3,
-    "TEMA": 4,
-    "TRIMA": 5,
-    "KAMA": 6,
-    "MAMA": 7,
-    "T3": 8
-}
-
 
 operadores = {
     "<": operator.lt,
@@ -284,7 +31,7 @@ operadores = {
     "!=": operator.ne
 }
 
-nn = load_trained_model("src/neuronal/data/nn_binary_best.json", input_dim=18)
+
 
 
 def obtener_ultimas_velas(symbol: str, fecha_str: str, timeframe: str, cont):
@@ -403,7 +150,7 @@ nodos_close = [
     for n in nodos_close
 ]
 
-entry_red = []
+
 order = 'NONE'
 is_open = False
 open_price_open = 0
@@ -424,14 +171,14 @@ def procesar_symbol(symbol, date, list_files_name, cont):
 
     # Concatenar histórico si aplica
     if cont > 1:
-        old_path = f'output/test_neuronal/{symbol}/{symbol}_data_test.csv'
+        old_path = f'output/test_neuronal/{symbol}/{symbol}_data_test.parquet'
         if os.path.exists(old_path):
-            old_data = pd.read_csv(old_path)
+            old_data = pd.read_parquet(old_path)
             df_data = pd.concat([old_data, df_data], ignore_index=True).drop(index=0)
 
     # Guardar datos actualizados
-    df_data.to_csv(
-        f'output/test_neuronal/{symbol}/{symbol}_data_test.csv',
+    df_data.to_parquet(
+        f'output/test_neuronal/{symbol}/{symbol}_data_test.parquet',
         index=False
     )
 
@@ -456,10 +203,30 @@ def limpiar_carpeta(ruta_carpeta):
     else:
         print(f"La carpeta '{ruta_carpeta}' no existe.")
 
+def actualizar_dict(principal, nuevo_dict):
+    """Actualiza dict_pips_best con nuevos datos."""
+    for k, v in nuevo_dict.items():
+        if k not in principal:
+            principal[k] = v  # Guardar valor real
+        else:
+            # Promedio ponderado (como en TradingEngine.record_trade)
+            principal[k] = (
+                principal[k] * 0.9 + v * 0.1
+            )
+    
+    return principal 
 
 #--------------------------------------------------------------------------------------------------------------
 if __name__ == "__main__":
+    
     limpiar_carpeta('output/test_neuronal/')
+    path_for_neuronal = f'src/neuronal/data/data_for_neuronal_{algorithm}_{principal_symbol}.csv'
+    X, Y = load_data(path_for_neuronal)
+    nn = load_trained_model(
+        "src/neuronal/data/model_trained.json",
+        input_dim=X.shape[1]
+    )
+    
     peticiones.initialize_mt5()
     context = zmq.Context()
     socket = context.socket(zmq.REP)
@@ -467,11 +234,26 @@ if __name__ == "__main__":
 
     print("Servidor Python listo...")
     cont = 0
-    with open('src/neuronal/data/maping_close.json', 'r') as file:
-        encoding_actions_close = json.load(file)   
+    moved_to_be = False
+
     with open('src/neuronal/data/maping_open.json', 'r') as file:
-        encoding_actions = json.load(file)
-     
+        maping_open = json.load(file)
+
+    with open('src/neuronal/data/maping_close.json', 'r') as file:
+        maping_close = json.load(file)
+        
+    with open('src/neuronal/data/best_score.json', 'r') as file:
+        best_score = json.load(file)
+    
+    dict_pips_best = best_score['dict_pips_best']
+    dict_pips = {}
+    neuro_evaluation = False
+    numero_iteracion_for_evalution = best_score['mas_perdidas_seguidas'] * 4  
+    cont_iteracion_for_evalution = 0
+    perdidas_seguidas = 0  
+    nodo_open = ''
+    nodo_close = ''
+
     while True:
         cont += 1 
         message = socket.recv_string()
@@ -483,35 +265,63 @@ if __name__ == "__main__":
 
         date = message.split(",")[0]
         open_price = float(message.split(",")[1])
-
+        dict_files.clear()
         # ------------------------------------------------------
         # 🔁 PROCESAMIENTO SECUENCIAL DE SÍMBOLOS
         # ------------------------------------------------------
-        if cont == 1:
-            for symbol in list_symbols:
-                try:
-                    procesar_symbol(symbol, date, list_files_name, cont)#
-                except Exception as e:
-                    print(f"❌ Error procesando {symbol}: {e}")
+        for symbol in list_symbols:
+            try:
+                procesar_symbol(symbol, date, list_files_name, cont)#
+            except Exception as e:
+                print(f"❌ Error procesando {symbol}: {e}")
                
         if is_open:
             for i, nodo in enumerate(nodos_close):
                 file = nodo["file"]
                 df = dict_files[f'{principal_symbol}_{file}']
-                row = df.iloc[-1]
+                row = df.iloc[-1]    
+                cerrar = False
                 if cumple_condiciones(row, nodo["conditions"]):
-                    entry_red_close = encoding_actions_close[nodo["key"]]
-                    entry_red = tuple(entry_red)
-                    entry_red_close = tuple(entry_red_close)
-                    clase, valor = predict_from_inputs(nn, entry_red, entry_red_close)
+                    nodo_close = maping_close[nodo["key"]]
+                    clase, prob = predict_from_inputs(nn, nodo_open, nodo_close)
                     
-                    if (clase == 1):
-                        order = 'CLOSE'
-                        is_open = False
-                        break
-                
+                    if algorithm == 'UP':
+                        trade_pips = open_price - open_price_open
                     else:
-                        order = 'NONE'
+                        trade_pips = open_price_open - open_price
+                        
+                    key = f'{nodo_open}_{nodo_close}'                    
+                    if key not in dict_pips:
+                            dict_pips[key] = trade_pips
+                    else:
+                        dict_pips[key] = (
+                            dict_pips[key] * 0.9 + trade_pips * 0.1
+                        )
+                        
+                    if clase == 1:  # Si la red predice que se debe cerrar
+                        cerrar = True
+                        
+                if cerrar:                   
+                    if algorithm == 'UP':
+                        trade_pips = open_price - open_price_open
+                    else:
+                        trade_pips = open_price_open - open_price
+                        
+                    if trade_pips < 0:
+                        perdidas_seguidas += 1
+                    else:
+                        perdidas_seguidas = 0
+                    
+                    if neuro_evaluation:
+                        cont_iteracion_for_evalution += 1
+                        if cont_iteracion_for_evalution >= numero_iteracion_for_evalution:
+                            neuro_evaluation = False
+                            cont_iteracion_for_evalution = 0
+                            print(f"Finalizó fase de evaluación neuronal después de {numero_iteracion_for_evalution} iteraciones.")
+                            
+                    order = 'CLOSE'
+                    is_open = False 
+                    break   
                 else:
                     order = 'NONE'
         else:
@@ -540,8 +350,7 @@ if __name__ == "__main__":
 
                         # si es el último símbolo, cargamos la red
                         if symbol == list_symbols[-1]:
-                            
-                            entry_red = encoding_actions[nodo["key"]]
+                            nodo_open = maping_open[nodo["key"]]
                             open_price_open = open_price
                             is_open = True
 
@@ -562,13 +371,55 @@ if __name__ == "__main__":
             else:
                 order = 'NONE'
 
-        print("→ Enviando orden:", order)
+        
+        if perdidas_seguidas > best_score['mas_perdidas_seguidas'] and neuro_evaluation:
+            date_red_neuronal = date.split()[0].replace('.', '-')
+            neuro_evaluation = False
+            backtester = Backtester(date_red_neuronal)
+            backtester.run()
+            
+        if perdidas_seguidas >= best_score['mas_perdidas_seguidas']:
+            interv = int(len(dict_pips)/8)
+            top = dict(
+                sorted(dict_pips.items(), key=lambda x: x[1], reverse=True)[:interv]
+            )
 
+            bottom = dict(
+                sorted(dict_pips.items(), key=lambda x: x[1])[:interv]
+            )
+            dict_pips_best = actualizar_dict(dict_pips_best, top)
+            dict_pips_best = actualizar_dict(dict_pips_best, bottom)
+            
+            perdidas_seguidas = 0
+            data_for_neuronal(algorithm, principal_symbol, dict_pips_best)
+            X, Y = load_data(path_for_neuronal)
+            print("Datos cargados:")
+            print("X shape:", X.shape)
+            print("Y shape:", Y.shape)
+            nn = BinaryNN(input_dim=X.shape[1], lr=0.01, target_loss=0.10)
+            nn.fit(X, Y, epochs=20000, batch_size=32)
+            # Guardar modelo entrenado
+            model_data = {
+                'W1': nn.W1.tolist(),
+                'b1': nn.b1.tolist(),
+                'W2': nn.W2.tolist(),
+                'b2': nn.b2.tolist(),
+                'W3': nn.W3.tolist(),
+                'b3': nn.b3.tolist(),
+                'W4': nn.W4.tolist(),
+                'b4': nn.b4.tolist()
+            }
+            with open('src/neuronal/data/model_trained.json', 'w') as f:
+                json.dump(model_data, f, indent=4)
+            print("Modelo entrenado guardado en 'src/neuronal/data/model_trained.json'")
+            nn = load_trained_model(
+                "src/neuronal/data/model_trained.json",
+                input_dim=X.shape[1]
+            )
+            neuro_evaluation = True
+            
+            
+        print("→ Enviando orden:", order)
         socket.send_string(order)
-        dict_files.clear()
-        if cont > 1:
-            for symbol in list_symbols:
-                try:
-                    procesar_symbol(symbol, date, list_files_name, cont)#
-                except Exception as e:
-                    print(f"❌ Error procesando {symbol}: {e}")
+        
+            

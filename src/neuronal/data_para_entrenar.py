@@ -3,13 +3,13 @@
 # Ensamblado listo para ejecutar como pipeline.
 
 import sys
+import ast
 import os
 import json
 import sqlite3
 import ast
 import operator
 import pandas as pd
-import time
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 
@@ -62,27 +62,59 @@ class Signal:
 #   Clase Normalizar
 # ================================
 class Normalizar:
-    def __init__(self, algorithms, principal_symbol, signal):
-        self.algorithms = algorithms
-        self.principal_symbol = principal_symbol
+    def __init__(self, signal):
         self.signal = signal
 
     def normalize_close_signals(self):
         signal = self.signal.get_close_signals()
         if signal is None:
             return None
-        asign = {elem: [int(b) for b in bin(i)[2:].zfill(9)] for i, elem in enumerate(signal, start=1)}
+        
+        if len(signal) < 64:
+           count = 6
+        elif len(signal) < 128:
+           count = 7
+        else:
+            count = 8   
+        asign = {}
+        for i, elem in enumerate(signal):
+            # Normalizar siempre
+            if isinstance(elem, str):
+                elem = ast.literal_eval(elem)
+
+            # Clave estable (NO str())
+            key = json.dumps(elem, sort_keys=True)
+            asign[key] = bin(i+1)[2:].zfill(count)  # Convertir a binario de 8 bits
+
         with open('src/neuronal/data/maping_close.json', 'w') as file:
             json.dump(asign, file, indent=4)
+
         return asign
 
     def normalize_open_signals(self):
         signal = self.signal.get_open_signals()
         if signal is None:
             return None
-        asign = {elem: [int(b) for b in bin(i)[2:].zfill(9)] for i, elem in enumerate(signal, start=1)}
+        if len(signal) < 64:
+           count = 6
+        elif len(signal) < 128:
+           count = 7
+        else:
+            count = 8
+        asign = {}
+
+        for i, elem in enumerate(signal):
+            # Normalizar siempre
+            if isinstance(elem, str):
+                elem = ast.literal_eval(elem)
+
+            # Clave estable (NO str())
+            key = json.dumps(elem, sort_keys=True)
+            asign[key] = bin(i+1)[2:].zfill(count)  # Convertir a binario de 8 bits
+
         with open('src/neuronal/data/maping_open.json', 'w') as file:
             json.dump(asign, file, indent=4)
+
         return asign
 
 # ================================
@@ -97,179 +129,42 @@ operadores = {
     "!=": operator.ne
 }
 
-def cumple_condiciones(fila, condiciones):
-    return all(operadores[op](fila[col], valor) for col, op, valor in condiciones if col in fila)
+def data_for_neuronal(algorithm, principal_symbol, dict_pips_best= {}):
 
-# ================================
-#   Obtener operaciones abiertas
-# ================================
-def get_operation_open(principal_symbol, last_symbol, algorithm):
-    def get_nodes():
-        conn = sqlite3.connect(f'output/db/crossing_{principal_symbol}_dbs/{last_symbol}.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM nodes WHERE label = ?', (algorithm,))
-        r = cursor.fetchall()
-        conn.close()
-        return r if r else None
-
-    nodes = get_nodes()
-    if not nodes:
-        return []
-
-    ids_conditions = [(n[0], n[2], n[3]) for n in nodes if n[3] is not None]
-    list_orders = []
-
-    for node_id, name_file, condition in ids_conditions:
-        conn = sqlite3.connect(f'output/db/crossing_{principal_symbol}_dbs/{last_symbol}.db')
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT dates FROM register WHERE node_id = ?
-            UNION ALL
-            SELECT dates_os FROM register_os WHERE node_id = ?
-        """, (node_id, node_id))
-        dates = cursor.fetchall()
-        conn.close()
-
-        if dates:
-            for date in dates:
-                list_orders.append((date[0], name_file, condition))
-
-    return list_orders
-
-
-
-def data_for_neuronal(algorithm, principal_symbol, intervalo, df_primitiva, indicadores_dict):
-
-    print("\n==============================")
-    print("INICIO data_for_neuronal DEBUG")
-    print("==============================")
-
-    # Cargar config
-    with open('config/list_{}.json'.format(algorithm), 'r') as f:
-        last_symbol = json.load(f)['list'][-1]
-
-    # Inicializar clases
-    signals = Signal(algorithm, principal_symbol)
-    _, _, _, last_symbol = signals.get_info()
-    normal = Normalizar(algorithm, principal_symbol, signals)
-
-    # Normalizaciones
-    close_norm = normal.normalize_close_signals()
-    open_norm = normal.normalize_open_signals()
-
-    # Operaciones abiertas
-    open_ops = get_operation_open(principal_symbol, last_symbol, algorithm)
-    if not open_ops:
-        print("⚠ No hay operaciones abiertas.")
-        return
-
-    list_codes = []
-
-    # Generar dataset neuronal
-    for date, name_file, cond_str in open_ops:
-        code1 = open_norm.get(cond_str)
-        if code1 is None:
-            continue
-
-        key_name = name_file.replace(last_symbol, principal_symbol)
-        df_ind = indicadores_dict.get(key_name)
-        if df_ind is None or df_ind.empty:
-            continue
-
-        idxs = df_primitiva.index[df_primitiva['time'] == date].tolist()
-        if not idxs:
-            continue
-        idx = idxs[0]
-
-        rest = df_primitiva.iloc[idx + 1: idx + intervalo].copy()
-        if rest.empty:
-            continue
-
-        rest.sort_values(by='open', ascending=False, inplace=True)
-        rest = rest.head(1) if algorithm == "UP" else rest.tail(1)
-
-        # 🔽 MEJORA 3: penalizar cierres tardíos
-        close_idx = rest.index[0]
-        delta = close_idx - idx           # cuántas velas tardó en cerrarse
-        penalty = 1 - (delta / 20)        # 1 = inmediato, 0 = muy tardío
-        merged = pd.merge(rest, df_ind, on='time', how='inner')
-        if merged.empty:
-            continue
-
-        for _, fila in merged.iterrows():
-            for key, code2 in close_norm.items():
-                try:
-                    conds = ast.literal_eval(key)
-                except:
+    signal = Signal(algorithm, principal_symbol)
+    normalizar = Normalizar(signal)
+    sign_close = normalizar.normalize_close_signals()
+    sign_open = normalizar.normalize_open_signals()
+    data = {
+        'input1': [],
+        'input2': [],
+        'output': []
+    }
+    for j, open in enumerate(sign_open.values()):
+        for i, close in enumerate(sign_close.values()):
+            if f'{open}_{close}' in dict_pips_best:
+                if dict_pips_best[f'{open}_{close}'] > 0:
+                    valor = 1
+                else:
+                    valor = 0
+            else:
+                if i > 0 or j > 0:
                     continue
-                out = int(
-                    cumple_condiciones(fila, conds)
-                    and abs(fila["close"] - fila["open"]) > 0.0002
-                    and penalty > 0.1      # ❌ penalización de cierre tardío
-                )
-                list_codes.append((code1, code2, out))
-
-    if not list_codes:
-        print("⚠ No se generaron datos neuronales.")
-        return
-
-    df = pd.DataFrame(list_codes, columns=["input1", "input2", "output"])
-    path = f"src/neuronal/data/data_{algorithm}_{principal_symbol}.csv"
-    df.to_csv(path, index=False)
-    print(f"✅ Dataset neuronal generado: {path}")
-
-
-def clean_majority(algorithm, principal_symbol):
-    path = f"src/neuronal/data/data_{algorithm}_{principal_symbol}.csv"
-
-    data = pd.read_csv(path)
-    data["input1_t"] = data["input1"].apply(ast.literal_eval).apply(tuple)
-    data["input2_t"] = data["input2"].apply(ast.literal_eval).apply(tuple)
-
-    def majority(grp):
-        if len(grp) < 10:
-            return None
-        return grp["output"].value_counts().idxmax()
-
-    cleaned = (
-        data.groupby(["input1_t", "input2_t"])
-        .apply(majority)
-        .reset_index()
-        .rename(columns={0: "output"})
-        .dropna(subset=["output"])
-    )
-
-
-    out = f"src/neuronal/data/data_cleaned_{algorithm}_{principal_symbol}.csv"
-    cleaned.to_csv(out, index=False)
-    print(f"✅ Datos limpiados por mayoría: {out}")
-    return cleaned
-
-
-# def clean_majority(algorithm, principal_symbol):
-#     path = f"src/neuronal/data/data_{algorithm}_{principal_symbol}.csv"
-
-#     data = pd.read_csv(path)
-#     data["input1_t"] = data["input1"].apply(ast.literal_eval).apply(tuple)
-#     data["input2_t"] = data["input2"].apply(ast.literal_eval).apply(tuple)
-
-#     grouped = (
-#         data.groupby(["input1_t", "input2_t"])
-#         .agg(
-#             total=("output", "count"),
-#             positives=("output", "sum")
-#         )
-#         .reset_index()
-#     )
-
-#     # 🔥 PROBABILIDAD REAL
-#     grouped["output"] = round(grouped["positives"] / grouped["total"], 1)
-
-#     # Filtrar muy pocos ejemplos
-#     grouped = grouped[grouped["total"] >= 5]
-
-#     out = f"src/neuronal/data/data_cleaned_{algorithm}_{principal_symbol}.csv"
-#     grouped[["input1_t", "input2_t", "output"]].to_csv(out, index=False)
-
-#     print(f"✅ Datos limpiados con probabilidad: {out}")
-#     return grouped
+                valor = 0
+            data['input1'].append(open)
+            data['input2'].append(close)
+            data['output'].append(valor)
+            
+    df = pd.DataFrame(data)
+    df.to_csv(f'src/neuronal/data/data_for_neuronal_{algorithm}_{principal_symbol}.csv', index=False)
+    
+    
+if __name__ == "__main__":
+    with open('config/config_crossing/config_crossing.json', 'r') as f:
+        config = json.load(f)
+    
+    with open('config/config_test/config_test_red.json', 'r') as f:
+        config_test = json.load(f)
+    
+    data_for_neuronal(config_test['algorithm'], config['principal_symbol'])
+      

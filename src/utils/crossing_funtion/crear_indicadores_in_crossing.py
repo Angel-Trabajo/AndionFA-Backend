@@ -35,13 +35,16 @@ timeframe = config['timeframe']
 list_symbol = config['list_symbol']
 
 
-def extract_indicadores():
+def extract_indicadores(data=None):
     """Extrae indicadores optimizado - SIN cambios estructurales grandes"""
     indicators_files = os.listdir(f'output/extrac')
     texto = indicators_files[0]
     fechas = re.findall(r'\d{8}', texto)
     str_start = f"{fechas[0][:4]}-{fechas[0][4:6]}-{fechas[0][6:]}"
     end = f"{fechas[1][:4]}-{fechas[1][4:6]}-{fechas[1][6:]}"
+    
+    if data is not None:
+        list_symbol.append(principal_symbol)
     
     for sym in list_symbol:
         
@@ -52,22 +55,30 @@ def extract_indicadores():
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             future1 = executor.submit(create_files_fast, sym, timeframe, 
                                      config_node['dateStart'], config_node['dateEnd'], 
-                                     indicators_files, 'extrac_os')
+                                     indicators_files, 'extrac_os', data)
             future2 = executor.submit(create_files_fast, sym, timeframe, 
-                                     str_start, end, indicators_files, 'extrac')
+                                     str_start, end, indicators_files, 'extrac', data)
             concurrent.futures.wait([future1, future2])
 
 
-def create_files_fast(symbol, timeframe, str_start, end, indicators_files, folder):
+def create_files_fast(symbol, timeframe, str_start, end, indicators_files, folder, data):
     
      # Leer CSV inmediatamente
-    if folder == 'extrac':
-        df= pd.read_csv(f'output/crossing_{principal_symbol}/{symbol}/is_os/is.csv')
+    if data is not None:
+        df = data
     else:
-        df= pd.read_csv(f'output/crossing_{principal_symbol}/{symbol}/is_os/os.csv')
+        if symbol == principal_symbol:
+            path = f'output'
+        else:
+            path = f'output/crossing_{principal_symbol}/{symbol}'
+        
+        if folder == 'extrac':
+            df= pd.read_csv(f'{path}/is_os/is.csv')
+        else:
+            df= pd.read_csv(f'{path}/is_os/os.csv')
     
-    start = datetime.strptime(str_start, '%Y-%m-%d')
-    pos, _ = _buscar_fecha_o_siguiente_fast(df, start)    
+        start = datetime.strptime(str_start, '%Y-%m-%d')
+        pos, _ = _buscar_fecha_o_siguiente_fast(df, start)    
     # PRECALCULAR arrays numpy UNA sola vez - CRÍTICO para velocidad
     high = df['high'].to_numpy(np.float64)
     low = df['low'].to_numpy(np.float64)
@@ -76,29 +87,34 @@ def create_files_fast(symbol, timeframe, str_start, end, indicators_files, folde
     time_arr = df['time'].to_numpy('datetime64[ns]')
      
     # Procesar TODOS los indicadores en paralelo
-    with concurrent.futures.ProcessPoolExecutor(max_workers=min(30, len(indicators_files), os.cpu_count())) as executor:
-        futures = {}
-        
+    if data is None:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=min(30, len(indicators_files), os.cpu_count())) as executor:
+            futures = {}
+            
+            for file in indicators_files:
+                future = executor.submit(
+                    _generate_files_fast, 
+                    file, pos, symbol, str_start, end, timeframe, folder,
+                    high, low, close, open_arr, time_arr, df
+                )
+                futures[future] = file
+            
+            # Esperar resultados
+            for future in concurrent.futures.as_completed(futures):
+                file = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Error {file}: {e}")
+    else:
         for file in indicators_files:
-            future = executor.submit(
-                _generate_files_fast, 
-                file, pos, symbol, str_start, end, timeframe, folder,
-                high, low, close, open_arr, time_arr, df
-            )
-            futures[future] = file
-        
-        # Esperar resultados
-        for future in concurrent.futures.as_completed(futures):
-            file = futures[future]
-            try:
-                future.result()
-            except Exception as e:
-                print(f"Error {file}: {e}")
+            _generate_files_fast(file, 1, symbol, str_start, end, timeframe,'extrac_os' ,high, low, close, open_arr, time_arr, df, True)
 
 
 def _generate_files_fast(indicator_file, pos, symbol, start, end, timeframe, folder,
-                        high, low, close, open_arr, time_arr, df_ref):
+                        high, low, close, open_arr, time_arr, df_ref, is_data=False):
     """Versión MEGA optimizada de _generate_files"""
+    
     # Leer archivo de configuración SIN caché (más rápido para pocos archivos)
     with open(f'config/extractor/{indicator_file}', 'r') as f:
         raw_lines = f.readlines()
@@ -289,8 +305,18 @@ def _generate_files_fast(indicator_file, pos, symbol, start, end, timeframe, fol
     
     # Guardar archivo
     name_f = f'_{symbol}_{start.replace("-", "")}_{end.replace("-", "")}_timeframe{timeframe}.parquet'
-    output_path = f'output/crossing_{principal_symbol}/{symbol}/{folder}/{indicator_file.replace(".csv", name_f)}'
-    output_df.to_parquet(output_path, index=False, engine='pyarrow', compression='snappy')
+    
+    if symbol == principal_symbol:
+         output_path = f'output/{folder}/{indicator_file.replace(".csv", name_f)}'
+    else:
+        output_path = f'output/crossing_{principal_symbol}/{symbol}/{folder}/{indicator_file.replace(".csv", name_f)}'
+    if is_data:
+        df_in = pd.read_parquet(output_path)
+        output_df = pd.concat([df_in, output_df], ignore_index=True)
+        output_df = output_df.drop_duplicates(subset=['time'])
+        output_df.to_parquet(output_path, index=False, engine='pyarrow', compression='snappy')
+    else:
+        output_df.to_parquet(output_path, index=False, engine='pyarrow', compression='snappy')
 
 
 def _buscar_fecha_o_siguiente_fast(df, fecha_objetivo):
