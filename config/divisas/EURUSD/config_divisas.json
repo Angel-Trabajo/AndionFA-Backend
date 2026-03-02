@@ -1,0 +1,70 @@
+{
+    "principal_symbol": "EURUSD",
+     "dict_symbol_correl": {
+        "AUDUSD": 0.37,
+        "CHFJPY": 0.21,
+        "EURCAD": 0.35,
+        "EURCHF": 0.24,
+        "EURJPY": 0.37,
+        "EURTRY": 0.32,
+        "GBPUSD": 0.415,
+        "NZDUSD": 0.37,
+        "USDCAD": 0.31,
+        "USDCHF": 0.515,
+        "USDJPY": 0.24,
+        "USDNOK": 0.43,
+        "USDSEK": 0.52
+    },
+    "list_symbol_inversos": [
+        "USDCAD",
+        "USDCHF",
+        "USDJPY",
+        "USDNOK",
+        "USDSEK"
+    ],
+    "list_symbol": [
+        "USDSEK",
+        "USDCHF",
+        "USDNOK",
+        "GBPUSD",
+        "AUDUSD",
+        "EURJPY",
+        "NZDUSD",
+        "EURCAD",
+        "EURTRY",
+        "USDCAD",
+        "EURCHF",
+        "USDJPY",
+        "CHFJPY"
+    ],
+    "list_symbol_down": [
+        "USDSEK",
+        "USDCHF",
+        "USDNOK",
+        "GBPUSD",
+        "AUDUSD",
+        "EURJPY",
+        "NZDUSD",
+        "EURCAD",
+        "EURTRY",
+        "USDCAD",
+        "EURCHF",
+        "USDJPY",
+        "CHFJPY"
+    ],
+    "list_symbol_up": [
+        "USDSEK",
+        "USDCHF",
+        "USDNOK",
+        "GBPUSD",
+        "AUDUSD",
+        "EURJPY",
+        "NZDUSD",
+        "EURCAD",
+        "EURTRY",
+        "USDCAD",
+        "EURCHF",
+        "USDJPY",
+        "CHFJPY"
+    ]
+}

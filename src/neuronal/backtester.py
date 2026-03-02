@@ -22,7 +22,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")
 from src.routes.peticiones import get_historical_data, get_timeframes
 from src.db.query import get_nodes_by_label
 from src.neuronal.data_para_entrenar import data_for_neuronal
-from src.utils.crossing_funtion.crear_indicadores_in_crossing import extract_indicadores
+from src.utils.indicadores_for_crossing import extract_indicadores
 from src.neuronal.entrenar import (
     load_trained_model,
     predict_from_inputs,

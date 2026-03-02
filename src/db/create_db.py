@@ -1,8 +1,8 @@
 import sqlite3
 import os
 
-def create_db(name):
-    db_path = f'output/db/{name}.db'
+def create_db(name, principal_symbol):
+    db_path = f'output/{principal_symbol}/db/{name}.db'
 
     if os.path.exists(db_path):
         conn = sqlite3.connect(db_path)
@@ -28,6 +28,7 @@ def create_db(name):
     CREATE TABLE IF NOT EXISTS nodes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         label TEXT,
+        mercado TEXT,
         file_in_db TEXT,
         conditions TEXT,
         correct_percentage REAL,
@@ -44,6 +45,7 @@ def create_db(name):
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         node_id INTEGER,
         dates TEXT,
+        mercado TEXT,
         veneficios REAL,
         FOREIGN KEY (node_id) REFERENCES nodes(id)
     )
@@ -53,6 +55,7 @@ def create_db(name):
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         node_id INTEGER,
         dates_os TEXT,
+        mercado TEXT,
         veneficios_os REAL,
         FOREIGN KEY (node_id) REFERENCES nodes(id)
     )

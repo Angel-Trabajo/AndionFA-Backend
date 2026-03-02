@@ -1,1 +1,0 @@
-& $iccPath -mmic -O3 mic_production.c -o mic_production.mic -pthread

@@ -25,13 +25,13 @@ def get_connection(db_path):
     return _thread_local.connections[db_path]
 
 def insertar_nodo_con_registros(
-    name, label, file_in_db, conditions,
+    name, label, mercado, file_in_db, conditions,
     correct_percentage, successful_operations, total_operations,
     correct_percentage_os, successful_operations_os, total_operations_os,
-    fechas=None, veneficios=None, fechas_os=None, veneficios_os=None
+    fechas=None, veneficios=None, fechas_os=None, veneficios_os=None, symbol=None
 ):
 
-    db_path = f'output/db/{name}.db'
+    db_path = f'output/{symbol}/db/{name}.db'
     conn = get_connection(db_path)
     cursor = conn.cursor()
 
@@ -46,13 +46,13 @@ def insertar_nodo_con_registros(
     else:
         cursor.execute('''
             INSERT INTO nodes (
-                label, file_in_db, conditions,
+                label, mercado, file_in_db, conditions,
                 correct_percentage, successful_operations, total_operations,
                 correct_percentage_os, successful_operations_os, total_operations_os
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
-            label, file_in_db, conditions,
+            label, mercado, file_in_db, conditions,
             correct_percentage, successful_operations, total_operations,
             correct_percentage_os, successful_operations_os, total_operations_os
         ))
@@ -61,35 +61,35 @@ def insertar_nodo_con_registros(
     # 🔥 INSERT MASIVO register
     if fechas and veneficios and len(fechas) == len(veneficios):
         cursor.executemany(
-            'INSERT INTO register (node_id, dates, veneficios) VALUES (?, ?, ?)',
-            [(nodo_id, f, v) for f, v in zip(fechas, veneficios)]
+            'INSERT INTO register (node_id, dates, mercado, veneficios) VALUES (?, ?, ?, ?)',
+            [(nodo_id, f, mercado, v) for f, v in zip(fechas, veneficios)]
         )
 
     # 🔥 INSERT MASIVO register_os
     if fechas_os and veneficios_os and len(fechas_os) == len(veneficios_os):
         cursor.executemany(
-            'INSERT INTO register_os (node_id, dates_os, veneficios_os) VALUES (?, ?, ?)',
-            [(nodo_id, f, v) for f, v in zip(fechas_os, veneficios_os)]
+            'INSERT INTO register_os (node_id, dates_os, mercado, veneficios_os) VALUES (?, ?, ?, ?)',
+            [(nodo_id, f, mercado, v) for f, v in zip(fechas_os, veneficios_os)]
         )
 
     conn.commit()
 
 
-def successful_operations_by_label(name, label: str) -> int:
-    path = f'output/db/{name}.db'
+def successful_operations_by_label(name, label: str, symbol: str, mercado: str) -> int:
+    path = f'output/{symbol}/db/{name}.db'
     conn = get_connection(path)
     cursor = conn.cursor()
 
     cursor.execute(
-        'SELECT SUM(successful_operations) FROM nodes WHERE label = ?', 
-        (label,)
+        'SELECT SUM(successful_operations) FROM nodes WHERE label = ? AND mercado = ?', 
+        (label, mercado)
     )
     result = cursor.fetchone()[0]
     return result if result is not None else 0
 
 
-def nodo_con_mas_fechas_hora_comunes(name, lista_fechas):
-    path = f'output/db/{name}.db'
+def nodo_con_mas_fechas_hora_comunes(name, lista_fechas, symbol, mercado):
+    path = f'output/{symbol}/db/{name}.db'
     conn = get_connection(path)
     cursor = conn.cursor()
 
@@ -100,9 +100,9 @@ def nodo_con_mas_fechas_hora_comunes(name, lista_fechas):
     cursor.execute(f'''
         SELECT node_id, dates
         FROM register
-        WHERE dates IN ({placeholders})
-    ''', lista_fechas)
-
+        WHERE dates IN ({placeholders} ) AND mercado = ?
+    ''', lista_fechas + [mercado])
+    
     resultados = cursor.fetchall()
 
 
@@ -119,7 +119,7 @@ def nodo_con_mas_fechas_hora_comunes(name, lista_fechas):
     coincidencias = conteo_por_nodo[node_id_mas_comun]
 
     # Obtener total_operations del nodo
-    conn = get_connection(f'output/db/{name}.db')
+    conn = get_connection(f'output/{symbol}/db/{name}.db')
     cursor = conn.cursor()
     cursor.execute('SELECT total_operations FROM nodes WHERE id = ?', (node_id_mas_comun,))
     resultado = cursor.fetchone()
@@ -136,8 +136,8 @@ def nodo_con_mas_fechas_hora_comunes(name, lista_fechas):
         return None
     
     
-def eliminar_nodo_y_registros(name, node_id):
-    path = f'output/db/{name}.db'
+def eliminar_nodo_y_registros(name, node_id, symbol):
+    path = f'output/{symbol}/db/{name}.db'
     conn = get_connection(path)
     cursor = conn.cursor()
 
