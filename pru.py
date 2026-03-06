@@ -1,4 +1,3 @@
-from datetime import datetime
-from src.utils.common_functions import get_previous_4_6
+from src.db.postgres import get_connection, release_connection
 
-print(get_previous_4_6("2021-01-01", "2023-01-01"))
+conn = get_connection()

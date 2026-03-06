@@ -75,22 +75,35 @@ def get_previous_4_6(date_start: str, date_end: str):
     )
     
 def filtro_mercado(df, mercado):
-
+    df = df.copy()
     if 'hour' not in df.columns:
-        df['hour'] = df['time'].dt.hour
+        df.loc[:, 'hour'] = df['time'].dt.hour
 
     h = df['hour']
 
     if mercado == "Asia":
-        mascara = (h >= 23) | (h <= 6)
+        mascara = (h >= 22) | (h <= 6)
 
     elif mercado == "Europa":
-        mascara = (h >= 7) & (h <= 13)
+        mascara = (h >= 6) & (h <= 13)
 
     elif mercado == "America":
-        mascara = (h >= 14) & (h <= 22)
+        mascara = (h >= 13) & (h <= 22)
 
     else:
         return df
 
     return df.loc[mascara]
+
+def hora_en_mercado(hour, mercado):
+
+    if mercado == "Asia":
+        return (hour >= 23) or (hour <= 6)
+
+    elif mercado == "Europa":
+        return 7 <= hour <= 13
+
+    elif mercado == "America":
+        return 14 <= hour <= 22
+
+    return True

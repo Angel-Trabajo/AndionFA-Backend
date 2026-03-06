@@ -4,10 +4,8 @@ import numpy as np
 import talib
 import concurrent.futures
 import os
-import re
 from datetime import datetime
-
-
+from src.utils.common_functions import get_previous_4_6
 
 
 replaceString = {
@@ -22,55 +20,43 @@ replaceString = {
     "T3": 8
 }
 
-with open('config/config_crossing/config_crossing.json', 'r') as file:
-    config = json.load(file)
 
-
-with open('config/config_node/config_node.json', encoding='utf-8') as f:
-    config_node = json.load(f)
-
-
-principal_symbol = config['principal_symbol']
-timeframe = config['timeframe'] 
-list_symbol = config['list_symbol']
-
-
-def extract_indicadores(data=None):
-    """Extrae indicadores optimizado - SIN cambios estructurales grandes"""
-    indicators_files = os.listdir(f'output/extrac')
-    texto = indicators_files[0]
-    fechas = re.findall(r'\d{8}', texto)
-    str_start = f"{fechas[0][:4]}-{fechas[0][4:6]}-{fechas[0][6:]}"
-    end = f"{fechas[1][:4]}-{fechas[1][4:6]}-{fechas[1][6:]}"
+def extract_indicadores(principal_symbol, data=None):
+    with open('config/general_config.json', 'r', encoding='utf8') as file:
+        general_config = json.load(file)
+    with open(f'config/divisas/{principal_symbol}/config_{principal_symbol}.json', 'r', encoding='utf8') as file:
+        config_symbol = json.load(file)
+        
+    list_symbol = config_symbol['list_symbol']
+    list_files = general_config['indicators_files']
+    timeframe = general_config['timeframe']
+    str_start, end = get_previous_4_6(general_config['dateStart'], general_config['dateEnd'])
     
     if data is not None:
         list_symbol.append(principal_symbol)
-    
+             
     for sym in list_symbol:
-        
-        list_files = os.listdir(f'output/extrac')
-        indicators_files = [file.split('_')[0]+'.csv' for file in list_files]
-        print(f"Procesando {sym}...")
+        print(f"Procesando divisa {principal_symbol} cruce :{sym}...")
         # Procesar EN PARALELO ambos folders
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            future1 = executor.submit(create_files_fast, sym, timeframe, 
-                                     config_node['dateStart'], config_node['dateEnd'], 
-                                     indicators_files, 'extrac_os', data)
-            future2 = executor.submit(create_files_fast, sym, timeframe, 
-                                     str_start, end, indicators_files, 'extrac', data)
+            future1 = executor.submit(_create_files_fast, sym, timeframe, 
+                                     general_config['dateStart'], general_config['dateEnd'], 
+                                     list_files, 'extrac_os', principal_symbol, data)
+            future2 = executor.submit(_create_files_fast, sym, timeframe, 
+                                     str_start, end, list_files, 'extrac',principal_symbol, data)
             concurrent.futures.wait([future1, future2])
 
 
-def create_files_fast(symbol, timeframe, str_start, end, indicators_files, folder, data):
+def _create_files_fast(symbol, timeframe, str_start, end, indicators_files, folder, principal_symbol, data):
     
      # Leer CSV inmediatamente
     if data is not None:
         df = data
     else:
         if symbol == principal_symbol:
-            path = f'output'
+            path = f'output/{principal_symbol}'
         else:
-            path = f'output/crossing_{principal_symbol}/{symbol}'
+            path = f'output/{principal_symbol}/crossing/{symbol}'
         
         if folder == 'extrac':
             df= pd.read_csv(f'{path}/is_os/is.csv')
@@ -95,7 +81,7 @@ def create_files_fast(symbol, timeframe, str_start, end, indicators_files, folde
                 future = executor.submit(
                     _generate_files_fast, 
                     file, pos, symbol, str_start, end, timeframe, folder,
-                    high, low, close, open_arr, time_arr, df
+                    high, low, close, open_arr, time_arr, df, principal_symbol
                 )
                 futures[future] = file
             
@@ -108,11 +94,11 @@ def create_files_fast(symbol, timeframe, str_start, end, indicators_files, folde
                     print(f"Error {file}: {e}")
     else:
         for file in indicators_files:
-            _generate_files_fast(file, 1, symbol, str_start, end, timeframe,'extrac_os' ,high, low, close, open_arr, time_arr, df, True)
+            _generate_files_fast(file, 1, symbol, str_start, end, timeframe,'extrac_os' ,high, low, close, open_arr, time_arr, df, principal_symbol, True)
 
 
 def _generate_files_fast(indicator_file, pos, symbol, start, end, timeframe, folder,
-                        high, low, close, open_arr, time_arr, df_ref, is_data=False):
+                        high, low, close, open_arr, time_arr, df_ref, principal_symbol, is_data=False):
     """Versión MEGA optimizada de _generate_files"""
     
     # Leer archivo de configuración SIN caché (más rápido para pocos archivos)
@@ -307,9 +293,9 @@ def _generate_files_fast(indicator_file, pos, symbol, start, end, timeframe, fol
     name_f = f'_{symbol}_{start.replace("-", "")}_{end.replace("-", "")}_timeframe{timeframe}.parquet'
     
     if symbol == principal_symbol:
-         output_path = f'output/{folder}/{indicator_file.replace(".csv", name_f)}'
+         output_path = f'output/{principal_symbol}/{folder}/{indicator_file.replace(".csv", name_f)}'
     else:
-        output_path = f'output/crossing_{principal_symbol}/{symbol}/{folder}/{indicator_file.replace(".csv", name_f)}'
+        output_path = f'output/{principal_symbol}/crossing/{symbol}/{folder}/{indicator_file.replace(".csv", name_f)}'
     if is_data:
         df_in = pd.read_parquet(output_path)
         output_df = pd.concat([df_in, output_df], ignore_index=True)

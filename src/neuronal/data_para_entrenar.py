@@ -11,52 +11,49 @@ import ast
 import operator
 import pandas as pd
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-
+from src.utils.common_functions import crear_carpeta_si_no_existe
+from src.db import query as db_query
 
 
 # ================================
 #   Clase Signal
 # ================================
 class Signal:
-    def __init__(self, algorithms, principal_symbol):
-        self.algorithms = algorithms
+    def __init__(self, algorithm, principal_symbol, mercado, config):
+        self.algorithm = algorithm
         self.principal_symbol = principal_symbol
-        _, _, other_algorithms, last_symbol = self.get_info()
-        self.other_algorithms = other_algorithms
+        self.mercado = mercado
+        self.config = config
+        _, _, other_algorithm, last_symbol = self.get_info()
+        self.other_algorithm = other_algorithm
         self.last_symbol = last_symbol
 
     def get_info(self):
-        if self.algorithms == "UP":
-            other_algorithms = "DOWN"
+        if self.algorithm == "UP":
+            other_algorithm = "DOWN"
         else:
-            other_algorithms = "UP"
-
-        with open(f'config/list_{self.algorithms}.json', 'r') as file:
-            data = json.load(file)
-            last_symbol = data['list'][-1]
-        return self.algorithms, self.principal_symbol, other_algorithms, last_symbol
+            other_algorithm = "UP"
+        last_symbol = self.config['symbol']['list_symbol'][-1]
+        return self.algorithm, self.principal_symbol, other_algorithm, last_symbol
 
     def get_close_signals(self):
-        def get_nodes():
-            conn = sqlite3.connect(f'output/db/{self.principal_symbol}.db')
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM nodes WHERE label = ?', (self.other_algorithms,))
-            res = cursor.fetchall()
-            conn.close()
-            return res if res else None
-        nodes = get_nodes()
-        return [(n[3]) for n in nodes] if nodes else None
+        
+        nodes = db_query.get_nodes(
+            principal_symbol=self.principal_symbol, 
+            symbol_cruce=self.principal_symbol, 
+            mercado=self.mercado, 
+            label=self.other_algorithm
+            )
+        return [(n[6]) for n in nodes] if nodes else None
 
     def get_open_signals(self):
-        def get_nodes():
-            conn = sqlite3.connect(f'output/db/crossing_{self.principal_symbol}_dbs/{self.last_symbol}.db')
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM nodes WHERE label = ?', (self.algorithms,))
-            res = cursor.fetchall()
-            conn.close()
-            return res if res else None
-        nodes = get_nodes()
-        return [n[3] for n in nodes] if nodes else None
+        nodes = db_query.get_nodes(
+            principal_symbol=self.principal_symbol, 
+            symbol_cruce=self.last_symbol, 
+            mercado=self.mercado, 
+            label=self.algorithm
+            )
+        return [n[6] for n in nodes] if nodes else None
 
 # ================================
 #   Clase Normalizar
@@ -86,7 +83,7 @@ class Normalizar:
             key = json.dumps(elem, sort_keys=True)
             asign[key] = bin(i+1)[2:].zfill(count)  # Convertir a binario de 8 bits
 
-        with open('src/neuronal/data/maping_close.json', 'w') as file:
+        with open(f'output/{self.signal.principal_symbol}/data_for_neuronal/maping_close_{self.signal.mercado}_{self.signal.algorithm}.json', 'w') as file:
             json.dump(asign, file, indent=4)
 
         return asign
@@ -112,7 +109,7 @@ class Normalizar:
             key = json.dumps(elem, sort_keys=True)
             asign[key] = bin(i+1)[2:].zfill(count)  # Convertir a binario de 8 bits
 
-        with open('src/neuronal/data/maping_open.json', 'w') as file:
+        with open(f'output/{self.signal.principal_symbol}/data_for_neuronal/maping_open_{self.signal.mercado}_{self.signal.algorithm}.json', 'w') as file:
             json.dump(asign, file, indent=4)
 
         return asign
@@ -129,9 +126,11 @@ operadores = {
     "!=": operator.ne
 }
 
-def data_for_neuronal(algorithm, principal_symbol, dict_pips_best= {}):
 
-    signal = Signal(algorithm, principal_symbol)
+def data_for_neuronal(config, mercado, algorithm, dict_pips_best= {}):
+    
+    principal_symbol = config['principal_symbol']
+    signal = Signal(algorithm, principal_symbol, mercado, config)
     normalizar = Normalizar(signal)
     sign_close = normalizar.normalize_close_signals()
     sign_open = normalizar.normalize_open_signals()
@@ -156,15 +155,28 @@ def data_for_neuronal(algorithm, principal_symbol, dict_pips_best= {}):
             data['output'].append(valor)
             
     df = pd.DataFrame(data)
-    df.to_csv(f'src/neuronal/data/data_for_neuronal_{algorithm}_{principal_symbol}.csv', index=False)
+    df.to_csv(f'output/{principal_symbol}/data_for_neuronal/data_{mercado}_{algorithm}.csv', index=False)
+
+
+def execute_data_for_neuronal(principal_symbol, mercados, list_algorithms = None, dict_pips_best= {}):
+    crear_carpeta_si_no_existe(f'output/{principal_symbol}/data_for_neuronal')
+    
+    with open(f'config/divisas/{principal_symbol}/config_{principal_symbol}.json', 'r', encoding='utf-8') as f:
+        config_symbol = json.load(f)
+    with open(f'config/general_config.json', 'r', encoding='utf-8') as f:
+        general_config = json.load(f)
+        
+    config = {
+        "general": general_config,
+        "symbol": config_symbol,
+        "principal_symbol": principal_symbol
+    }
+    list_algorithms = ["UP", "DOWN"] if list_algorithms is None else list_algorithms
+    for algorithm in list_algorithms:
+        for mercado in mercados:
+            data_for_neuronal(config, mercado, algorithm, dict_pips_best)
     
     
 if __name__ == "__main__":
-    with open('config/config_crossing/config_crossing.json', 'r') as f:
-        config = json.load(f)
-    
-    with open('config/config_test/config_test_red.json', 'r') as f:
-        config_test = json.load(f)
-    
-    data_for_neuronal(config_test['algorithm'], config['principal_symbol'])
+    pass
       

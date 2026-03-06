@@ -14,11 +14,12 @@ from typing import List
 from src.routes import peticiones 
 from ..models.indicators import ConfigRequest
 from src.scripts.create_indicators import create_files
-from src.scripts.node_builder import create_trees
-from src.db.query import get_nodes
-#from src.utils.crossing_funtion.extrat_data import extract_data_crossing, select_symbols_correl
+from src.scripts.node_builder import execute_node_builder
+from src.scripts.crossing_builder_cpu import execute_crossing_builder
 from dotenv import load_dotenv
 from src.utils.common_functions import crear_carpeta_si_no_existe, get_previous_4_6
+from src.neuronal.data_para_entrenar import execute_data_for_neuronal
+from src.db import query
 
 load_dotenv()
 
@@ -101,6 +102,7 @@ async def postnode_config(request: ConfigRequest):
 
 @router.post("/execute-algorithm")
 def execute_algorithm():
+    #query.eliminar_nodos_y_registros()
     with open(PATH_GENERAL_CONFIG, 'r', encoding='utf8') as file:
         config = json.load(file)
     list_mercado = ['Asia', 'Europa', 'America'] 
@@ -112,11 +114,14 @@ def execute_algorithm():
     date_start_is, date_end_is = get_previous_4_6(date_start_os, date_end_os)
     
     for symbol in list_principal_symbols:
-        crear_carpeta_si_no_existe(f'config/divisas/{symbol}')
-        crear_carpeta_si_no_existe(f'output/{symbol}')
-        create_files(symbol, timeframe, date_start_os, date_end_os, indicadors_files, 'extrac_os')
-        create_files(symbol, timeframe, date_start_is, date_end_is, indicadors_files, 'extrac')
-        create_trees(symbol, list_mercado)
+        # crear_carpeta_si_no_existe(f'config/divisas/{symbol}')
+        # crear_carpeta_si_no_existe(f'output/{symbol}')
+        # create_files(symbol, timeframe, date_start_os, date_end_os, indicadors_files, 'extrac_os')
+        # create_files(symbol, timeframe, date_start_is, date_end_is, indicadors_files, 'extrac')
+        # execute_node_builder(symbol, list_mercado)
+        # execute_crossing_builder(symbol, list_mercado)
+        execute_data_for_neuronal(symbol, list_mercado, list_algorithms = None, dict_pips_best= {})  
+        pass
 
     return {
         "status": "ok",

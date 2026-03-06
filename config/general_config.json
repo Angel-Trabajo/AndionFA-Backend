@@ -1,8 +1,9 @@
 {
     "list_principal_symbols": [
-        "EURAUD",
+        "EURJPY",
         "EURCAD",
         "EURGBP",
+        "EURNZD",
         "EURUSD"
     ],
     "indicators_files": [
@@ -38,7 +39,7 @@
     "NTotal": 50,
     "MinOperationsIS": 50,
     "MinOperationsOS": 20,
-    "NumMaxOperations": 3000,
+    "NumMaxOperations": 4500,
     "MinSuccessRate": 0.5,
     "MaxSuccessRate": 0.55,
     "ProgressiveVariation": 0.05,
