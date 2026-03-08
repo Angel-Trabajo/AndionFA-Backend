@@ -346,8 +346,8 @@ def procesar_archivo(file: str, symbol, mercado):
 def execute_node_builder(symbol, mercados):  
     peticiones.initialize_mt5()
     
-    # for mercado in mercados:
-    #     db_query.eliminar_nodos_y_registros(principal_symbol=symbol, symbol_cruce=symbol, mercado=mercado)
+    for mercado in mercados:
+        db_query.eliminar_nodos_y_registros(principal_symbol=symbol, symbol_cruce=symbol, mercado=mercado)
         
     list_files = os.listdir(f'output/{symbol}/extrac')
     

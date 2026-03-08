@@ -297,6 +297,7 @@ def eliminar_nodos_y_registros(
 
     conn.commit()
     release_connection(conn)
+    print(f"Nodos y registros han sido eliminados. Filtros aplicados: principal_symbol={principal_symbol}, symbol_cruce={symbol_cruce}, mercado={mercado}")
 
 
 def promedio_correct_percentage(principal_symbol, symbol_cruce, mercado, label, modo):
@@ -364,7 +365,20 @@ def get_nodes(principal_symbol, symbol_cruce, mercado, label):
     release_connection(conn)
     return res if res else None
 
+def get_nodes_by_label(principal_symbol, symbol_cruce, mercado, label):
+    conn = get_connection()
+    cursor = conn.cursor()
 
+    # Buscar todos los registros de la tabla 'nodes'
+    cursor.execute(
+        'SELECT conditions, file_in_db FROM nodes WHERE label = %s AND principal_symbol = %s AND symbol_cruce = %s AND mercado = %s', 
+        (label, principal_symbol, symbol_cruce, mercado))
+    resultados = cursor.fetchall()
+
+    release_connection(conn)
+    if not resultados:
+        return None
+    return resultados
 
 
 # def get_node_by_id(name, id_node):
@@ -478,16 +492,3 @@ def get_nodes(principal_symbol, symbol_cruce, mercado, label):
 #     return resultados
 
 
-# def get_nodes_by_label(name, label):
-#     path = f'output/db/{name}.db'
-#     conn = sqlite3.connect(path)
-#     cursor = conn.cursor()
-
-#     # Buscar todos los registros de la tabla 'nodes'
-#     cursor.execute('SELECT conditions, file_in_db FROM nodes WHERE label = ?', (label,))
-#     resultados = cursor.fetchall()
-
-#     conn.close()
-#     if not resultados:
-#         return None
-#     return resultados

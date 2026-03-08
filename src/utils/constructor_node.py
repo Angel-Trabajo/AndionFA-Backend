@@ -6,7 +6,7 @@ import time
 
 class NodeGenerator:
 
-    def __init__(self, df, min_cond=6, max_cond=12):
+    def __init__(self, df, min_cond=7, max_cond=12, pct_min=10, pct_max=90):
 
         self.MIN_COND = min_cond
         self.MAX_COND = max_cond
@@ -26,11 +26,24 @@ class NodeGenerator:
         self.mins = np.min(self.data, axis=0)
         self.maxs = np.max(self.data, axis=0)
 
+        # Percentiles precomputados por feature
+        self.pct_min = pct_min
+        self.pct_max = pct_max
+        self.pct_values = np.percentile(
+            self.data,
+            np.arange(self.pct_min, self.pct_max + 1),
+            axis=0
+        )
+
     # ---------- generar condicion ----------
     def _generar_condicion(self):
 
         idx = random.randrange(self.n_features)
-        valor = random.uniform(self.mins[idx], self.maxs[idx])
+        if self.pct_min is not None and self.pct_max is not None:
+            pct_idx = random.randrange(0, self.pct_values.shape[0])
+            valor = float(self.pct_values[pct_idx, idx])
+        else:
+            valor = random.uniform(self.mins[idx], self.maxs[idx])
         op = random.getrandbits(1)
 
         return (idx, op, valor)
@@ -87,12 +100,3 @@ class NodeGenerator:
         return nodos
 
 
-if __name__ == '__main__':
-    inicio = time.time()
-    df = pd.read_csv('output/crossing_EURUSD/AUDUSD/extrac/Ext-011616_AUDUSD_20170101_20210101_timeframeH1.csv')
-
-    gen = NodeGenerator(df)
-    nodos = gen.generar_nodos(100)
-
-    print(nodos[0:3])
-    print(time.time()-inicio)

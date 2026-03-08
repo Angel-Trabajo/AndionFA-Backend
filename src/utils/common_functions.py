@@ -52,11 +52,7 @@ def crear_carpeta_si_no_existe(ruta_carpeta):
         print(f"La carpeta '{ruta_carpeta}' ya existe.")
 
 def get_previous_4_6(date_start: str, date_end: str):
-    """
-    date_start -> fecha más reciente
-    date_end   -> fecha más antigua
-    """
-
+   
     start = datetime.strptime(date_start, "%Y-%m-%d")
     end = datetime.strptime(date_end, "%Y-%m-%d")
 

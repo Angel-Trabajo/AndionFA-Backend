@@ -1,3 +1,7 @@
-from src.db.postgres import get_connection, release_connection
+from src.db.query import get_nodes
 
-conn = get_connection()
+mercados = ["Asia", "Europa", "America"]
+algorithms = ["UP", "DOWN"]
+symbol = "EURUSD"
+task =  [(symbol, mercado, algorithm) for mercado in mercados for algorithm in algorithms]
+print(task)

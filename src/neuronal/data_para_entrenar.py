@@ -83,7 +83,7 @@ class Normalizar:
             key = json.dumps(elem, sort_keys=True)
             asign[key] = bin(i+1)[2:].zfill(count)  # Convertir a binario de 8 bits
 
-        with open(f'output/{self.signal.principal_symbol}/data_for_neuronal/maping_close_{self.signal.mercado}_{self.signal.algorithm}.json', 'w') as file:
+        with open(f'output/{self.signal.principal_symbol}/data_for_neuronal/maping/maping_close_{self.signal.mercado}_{self.signal.algorithm}.json', 'w') as file:
             json.dump(asign, file, indent=4)
 
         return asign
@@ -92,9 +92,8 @@ class Normalizar:
         signal = self.signal.get_open_signals()
         if signal is None:
             return None
-        if len(signal) < 64:
-           count = 6
-        elif len(signal) < 128:
+        
+        if len(signal) < 128:
            count = 7
         else:
             count = 8
@@ -109,7 +108,7 @@ class Normalizar:
             key = json.dumps(elem, sort_keys=True)
             asign[key] = bin(i+1)[2:].zfill(count)  # Convertir a binario de 8 bits
 
-        with open(f'output/{self.signal.principal_symbol}/data_for_neuronal/maping_open_{self.signal.mercado}_{self.signal.algorithm}.json', 'w') as file:
+        with open(f'output/{self.signal.principal_symbol}/data_for_neuronal/maping/maping_open_{self.signal.mercado}_{self.signal.algorithm}.json', 'w') as file:
             json.dump(asign, file, indent=4)
 
         return asign
@@ -155,11 +154,13 @@ def data_for_neuronal(config, mercado, algorithm, dict_pips_best= {}):
             data['output'].append(valor)
             
     df = pd.DataFrame(data)
-    df.to_csv(f'output/{principal_symbol}/data_for_neuronal/data_{mercado}_{algorithm}.csv', index=False)
+    df.to_csv(f'output/{principal_symbol}/data_for_neuronal/data/data_{mercado}_{algorithm}.csv', index=False)
 
 
 def execute_data_for_neuronal(principal_symbol, mercados, list_algorithms = None, dict_pips_best= {}):
     crear_carpeta_si_no_existe(f'output/{principal_symbol}/data_for_neuronal')
+    crear_carpeta_si_no_existe(f'output/{principal_symbol}/data_for_neuronal/data')
+    crear_carpeta_si_no_existe(f'output/{principal_symbol}/data_for_neuronal/maping')
     
     with open(f'config/divisas/{principal_symbol}/config_{principal_symbol}.json', 'r', encoding='utf-8') as f:
         config_symbol = json.load(f)

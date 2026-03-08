@@ -602,9 +602,9 @@ def execute_crossing_builder(principal_symbol, list_mercado):
     with open(f'config/divisas/{principal_symbol}/config_{principal_symbol}.json', 'r', encoding='utf-8') as f:
         config_symbol = json.load(f)
         
-    # for symbol in config_symbol['list_symbol']:
-    #     for mercado in list_mercado:
-    #         db_query.eliminar_nodos_y_registros(principal_symbol, symbol, mercado)
+    for symbol in config_symbol['list_symbol']:
+        for mercado in list_mercado:
+            db_query.eliminar_nodos_y_registros(principal_symbol, symbol, mercado)
             
     config = {
         "general": general_config,

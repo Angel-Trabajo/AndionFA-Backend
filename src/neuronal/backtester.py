@@ -23,6 +23,7 @@ from src.routes.peticiones import get_historical_data, get_timeframes
 from src.db.query import get_nodes_by_label
 from src.neuronal.data_para_entrenar import data_for_neuronal
 from src.utils.indicadores_for_crossing import extract_indicadores
+from src.utils.common_functions import get_previous_4_6, hora_en_mercado
 from src.neuronal.entrenar import (
     load_trained_model,
     predict_from_inputs,
@@ -32,7 +33,7 @@ from src.neuronal.entrenar import (
 
 class Backtester:
 
-    def __init__(self, date_end=None):
+    def __init__(self, principal_symbol, mercado, algorithm, date_end=None):
 
         print("Starting backtest...")
         self.comienzo = time.time()
@@ -44,7 +45,15 @@ class Backtester:
         self.peor_trade = 0.0
         self.dict_pips_best = {}
         self.data_end = date_end
-
+        self.principal_symbol = principal_symbol
+        self.mercado = mercado
+        self.algorithm = algorithm
+        
+        if self.algorithm == "UP":
+            self.other_algorithm = "DOWN"
+        else:
+            self.other_algorithm = "UP"
+        
         self.DATA_CACHE = {}
         self.COMBINED = {}
 
@@ -56,36 +65,32 @@ class Backtester:
         self.load_nodes()
         self.extract_required_columns()
         self.preload_data()
+
+        self.horas_mercado = [hora_en_mercado(h, self.mercado) for h in range(24)]
     
     
     def load_config(self):
-        with open('config/config_test/config_test_red.json') as f:
-            config = json.load(f)
-
-        self.algorithm = config['algorithm']
-        self.other_algorithm = 'DOWN' if self.algorithm == 'UP' else 'UP'
-
-        with open(f'config/list_{self.algorithm}.json') as f:
-            config_extractor = json.load(f)
-
-        with open('config/config_crossing/config_crossing.json') as f:
-            config_crossing = json.load(f)
-
-        with open('config/config_node/config_node.json') as f:
-            config_node = json.load(f)
-
-        self.list_symbols = config_extractor['list']
-        self.principal_symbol = config_crossing['principal_symbol']
-        self.list_symbols.insert(0, self.principal_symbol)
-        self.config_crossing = config_crossing
-        self.config_node = config_node   
+        with open(f'config/divisas/{self.principal_symbol}/config_{self.principal_symbol}.json', 'r') as file:
+            config_symbol = json.load(file)
+        with open(f'config/general_config.json', 'r', encoding='utf-8') as f:
+            general_config = json.load(f)
         
+        self.list_symbols = config_symbol['list_symbol']
+        self.list_symbols.insert(0, self.principal_symbol)
+        self.general_config = general_config
+        self.config_symbol = config_symbol
+        data_start_is, data_end_is = get_previous_4_6(
+            self.general_config['dateStart'], 
+            self.general_config['dateEnd']
+        )
+        self.data_start_is = data_start_is
+        self.data_end_is = data_end_is
         
     def prepare_base_data(self):
 
         if self.data_end is None:
-            df_is = pd.read_csv('output/is_os/is.csv')
-            df_os = pd.read_csv('output/is_os/os.csv')
+            df_is = pd.read_csv(f'output/{self.principal_symbol}/is_os/is.csv')
+            df_os = pd.read_csv(f'output/{self.principal_symbol}/is_os/os.csv')
 
             df_base1 = (
                 pd.concat([df_is, df_os], ignore_index=True)
@@ -96,8 +101,8 @@ class Backtester:
 
             df_base = df_base1[
                 df_base1['time'] >= datetime.strptime(
-                    self.config_node['dateStart'], '%Y-%m-%d'
-                ) - relativedelta(years=4)
+                    self.data_start_is, '%Y-%m-%d'
+                )
             ]
         else:
             timeframes = get_timeframes()
@@ -109,13 +114,13 @@ class Backtester:
 
             # Volver a formato string
             fecha_6_atras_str = fecha_6_atras.strftime("%Y-%m-%d")
-            timeframe = timeframes.get(self.config_crossing['timeframe']) 
+            timeframe = timeframes.get(self.general_config['timeframe']) 
             rates = get_historical_data(self.principal_symbol, timeframe, fecha_6_atras_str, self.data_end)
             df_base = pd.DataFrame(rates)
             df_base['time'] = pd.to_datetime(df_base['time'], unit='s')
             df_base_for_indicators = df_base.copy()
-            list_files_ = os.listdir('output/extrac_os')
-            indicadores_m =pd.read_parquet(f'output/extrac_os/{list_files_[0]}', columns=['time'])
+            list_files_ = os.listdir(f'output/{self.principal_symbol}/extrac_os')
+            indicadores_m =pd.read_parquet(f'output/{self.principal_symbol}/extrac_os/{list_files_[0]}', columns=['time'])
             time_ultimo_indicador = indicadores_m['time'].iloc[-1]
             index_coincidencia = df_base_for_indicators[df_base_for_indicators['time'] == time_ultimo_indicador].index[0]
             if index_coincidencia >= 830:
@@ -129,8 +134,6 @@ class Backtester:
         corte = int(0.8 * len(df_base))
         self.df_train = df_base.iloc[:corte]
         self.df_valid = df_base.iloc[corte:]   
-       
-    
     
     # ============================================================
     # FUNCIONES AUXILIARES
@@ -188,10 +191,10 @@ class Backtester:
             "!=": operator.ne
         }
 
-        with open('src/neuronal/data/maping_open.json', 'r') as file:
+        with open(f'output/{self.principal_symbol}/data_for_neuronal/maping/maping_open_{self.mercado}_{self.algorithm}.json', 'r') as file:
             self.maping_open = json.load(file)
 
-        with open('src/neuronal/data/maping_close.json', 'r') as file:
+        with open(f'output/{self.principal_symbol}/data_for_neuronal/maping/maping_close_{self.mercado}_{self.algorithm}.json', 'r') as file:
             self.maping_close = json.load(file)  
     
        
@@ -204,13 +207,12 @@ class Backtester:
         self.dict_nodos = {}
 
         for i, symbol in enumerate(self.list_symbols):
-            label = symbol if i == 0 else f'crossing_{self.principal_symbol}_dbs/{symbol}'
             self.dict_nodos[symbol] = self.parsear_nodos(
-                get_nodes_by_label(label, self.algorithm)
+                get_nodes_by_label(self.principal_symbol, symbol, self.mercado, self.algorithm)
             )
 
         self.nodos_close = self.parsear_nodos(
-            get_nodes_by_label(self.principal_symbol, self.other_algorithm)
+            get_nodes_by_label(self.principal_symbol, self.principal_symbol, self.mercado, self.other_algorithm)
         )  
        
     
@@ -275,7 +277,8 @@ class Backtester:
         return {
             "df": df,
             "values": df.values,
-            "col_map": {col: i for i, col in enumerate(df.columns)}
+            "col_map": {col: i for i, col in enumerate(df.columns)},
+            "index_values": df.index.values
         }
         
         
@@ -290,15 +293,15 @@ class Backtester:
         # CLOSE
         FILES_OS_CLOSE = {
             f.split('_')[0]: f
-            for f in os.listdir('output/extrac_os')
+            for f in os.listdir(f'output/{self.principal_symbol}/extrac_os')
         }
 
         for nodo in self.nodos_close:
 
-            path_is = f'output/extrac/{nodo["file"]}'
+            path_is = f'output/{self.principal_symbol}/extrac/{nodo["file"]}'
             file_base = nodo["file"].split('_')[0]
             file_os = FILES_OS_CLOSE[file_base]
-            path_os = f'output/extrac_os/{file_os}'
+            path_os = f'output/{self.principal_symbol}/extrac_os/{file_os}'
 
             self.COMBINED[("close", nodo["file"])] = self.build_combined(path_is, path_os)
 
@@ -306,10 +309,10 @@ class Backtester:
         for symbol in self.list_symbols:
 
             if symbol == self.principal_symbol:
-                path = 'output'
-                path_os_root = 'output/extrac_os'
+                path = f'output/{self.principal_symbol}'
+                path_os_root = f'{path}/extrac_os'
             else:
-                path = f'output/crossing_{self.principal_symbol}/{symbol}'
+                path = f'output/{self.principal_symbol}/crossing/{symbol}'
                 path_os_root = f'{path}/extrac_os'
 
             FILES_LOCAL = {
@@ -336,11 +339,11 @@ class Backtester:
 
     def train_iteration(self):
 
-        path_data_red = f'src/neuronal/data/data_for_neuronal_{self.algorithm}_{self.principal_symbol}.csv'
+        path_data_red = f'output/{self.principal_symbol}/data_for_neuronal/data/data_{self.mercado}_{self.algorithm}.csv'
         X, Y = load_data(path_data_red)
 
         nn = load_trained_model(
-            "src/neuronal/data/model_trained.json",
+            f"output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.json",
             input_dim=X.shape[1]
         )
 
@@ -353,9 +356,14 @@ class Backtester:
         dict_pips = {}
 
         for row in self.df_train.itertuples():
-
+            
             time_actual = row.Index
-            open_price = row.open
+            time_actual_np = np.datetime64(time_actual)
+            if not is_open:
+                if not self.horas_mercado[time_actual.hour]:
+                    continue
+            
+            open_price = row.open 
 
             # =========================
             # CIERRE
@@ -366,9 +374,7 @@ class Backtester:
                 for nodo in self.nodos_close:
 
                     df_struct = self.COMBINED[("close", nodo["file"])]
-                    df = df_struct["df"]
-
-                    pos = df.index.searchsorted(time_actual)
+                    pos = df_struct["index_values"].searchsorted(time_actual_np)
                     if pos == 0:
                         continue
 
@@ -418,9 +424,7 @@ class Backtester:
                     for nodo in nodo_open_list:
 
                         df_struct = self.COMBINED[("open", symbol, nodo["file"])]
-                        df = df_struct["df"]
-
-                        pos = df.index.searchsorted(time_actual)
+                        pos = df_struct["index_values"].searchsorted(time_actual_np)
                         if pos == 0:
                             continue
 
@@ -444,25 +448,20 @@ class Backtester:
         # =========================
         if self.index == 1:
             self.dict_pips_best = dict_pips
-        else:
-            top = dict(
-                sorted(dict_pips.items(), key=lambda x: x[1], reverse=True)[:40]
-            )
-
-            bottom = dict(
-                sorted(dict_pips.items(), key=lambda x: x[1])[:40]
-            )
-
-            self.dict_pips_best = self.actualizar_dict(self.dict_pips_best, top)
-            self.dict_pips_best = self.actualizar_dict(self.dict_pips_best, bottom)
-
+        else:        
+            self.dict_pips_best = self.actualizar_dict(self.dict_pips_best, dict_pips)
         print(len(self.dict_pips_best), "pips para actualizar en la próxima iteración")
 
         # =========================
         # REENTRENAMIENTO
         # =========================
 
-        data_for_neuronal(self.algorithm, self.principal_symbol, self.dict_pips_best)
+        config = {
+            "general": self.general_config,
+            "symbol": self.config_symbol,
+            "principal_symbol": self.principal_symbol
+        }
+        data_for_neuronal(config, self.mercado, self.algorithm, self.dict_pips_best)
 
         X, Y = load_data(path_data_red)
 
@@ -484,10 +483,10 @@ class Backtester:
             'b4': nn.b4.tolist()
         }
 
-        with open('src/neuronal/data/model_trained.json', 'w') as f:
+        with open(f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.json', 'w') as f:
             json.dump(model_data, f, indent=4)
 
-        print("Modelo entrenado guardado en 'src/neuronal/data/model_trained.json'")
+        print(f"Modelo entrenado guardado en 'output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.json'")
 
         return model_data
     
@@ -498,11 +497,11 @@ class Backtester:
 
     def validate_iteration(self):
 
-        path_data_red = f'src/neuronal/data/data_for_neuronal_{self.algorithm}_{self.principal_symbol}.csv'
+        path_data_red = f'output/{self.principal_symbol}/data_for_neuronal/data/data_{self.mercado}_{self.algorithm}.csv'
         X, Y = load_data(path_data_red)
 
         nn = load_trained_model(
-            "src/neuronal/data/model_trained.json",
+            f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.json',
             input_dim=X.shape[1]
         )
 
@@ -510,6 +509,7 @@ class Backtester:
         open_price_open = 0.0
         entry_red_open = ''
         cierre = 0
+        time_comienzo = None
 
         cantidad_operaciones = 0
         operaciones_acertadas = 0
@@ -526,6 +526,10 @@ class Backtester:
         for row in self.df_valid.itertuples():
 
             time_actual = row.Index
+            time_actual_np = np.datetime64(time_actual)
+            if not is_open:
+                if not self.horas_mercado[time_actual.hour]:
+                    continue
             open_price = row.open
 
             # =========================
@@ -535,9 +539,7 @@ class Backtester:
                 cierre += 1
                 for nodo in self.nodos_close:
                     df_struct = self.COMBINED[("close", nodo["file"])]
-                    df = df_struct["df"]
-
-                    pos = df.index.searchsorted(time_actual)
+                    pos = df_struct["index_values"].searchsorted(time_actual_np)
                     if pos == 0:
                         continue
 
@@ -574,7 +576,7 @@ class Backtester:
                             operaciones_perdedoras += 1
                             perdida_bruta += abs(trade_pips)
 
-                        print(f"SUM PIPS: {time_actual}: {sum_pips}", cierre)
+                        print(f"SUM PIPS:{time_comienzo} ---- {time_actual}: {sum_pips}", cierre)
                         break
 
             # =========================
@@ -592,9 +594,8 @@ class Backtester:
                     for nodo in nodo_open_list:
 
                         df_struct = self.COMBINED[("open", symbol, nodo["file"])]
-                        df = df_struct["df"]
-
-                        pos = df.index.searchsorted(time_actual)
+                        pos = df_struct["index_values"].searchsorted(time_actual_np)
+                        
                         if pos == 0:
                             continue
 
@@ -605,6 +606,7 @@ class Backtester:
                             if symbol == self.list_symbols[-1]:
                                 open_price_open = open_price
                                 is_open = True
+                                time_comienzo = time_actual
                                 nodo_open = self.maping_open[nodo["key"]]
                                 entry_red_open = nodo_open
 
@@ -683,20 +685,7 @@ class Backtester:
             self.best_score = score
             self.best_model_data = model_data
             self.peor_trade = min(metrics["lista_pips"]) if metrics["lista_pips"] else 0
-
-            with open('src/neuronal/data/best_score.json', 'w') as f:
-                json.dump({
-                    "score": self.best_score,
-                    "operaciones": metrics["cantidad_operaciones"],
-                    "winrate": metrics["winrate"],
-                    "profit_factor": metrics["profit_factor"],
-                    "expectancy": metrics["expectancy"],
-                    "pips_totales": metrics["sum_pips"],
-                    "peor_trade": self.peor_trade,
-                    "mas_perdidas_seguidas": metrics["mas_perdidas_seguidas"],
-                    "dict_pips_best": self.dict_pips_best
-                }, f, indent=4)
-
+            print(f"Nuevo mejor modelo encontrado con score: {score:.4f}")
         return score
     
     # ============================================================
@@ -704,15 +693,21 @@ class Backtester:
     # ============================================================
 
     def run(self):
+        last_model_data = None
 
         for i in range(40):
+            random.shuffle(self.nodos_close)
             print(f"\n--- Iteración {i+1} ---")
             self.index = i + 1
-            model_data = self.train_iteration()
+            model_data = self.train_iteration()#
+            last_model_data = model_data
             metrics = self.validate_iteration()
             self.calculate_score(metrics, model_data)
 
-        with open('src/neuronal/data/model_trained.json', 'w') as f:
+        if self.best_model_data is None:
+            self.best_model_data = last_model_data
+
+        with open(f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.json', 'w') as f:
             json.dump(self.best_model_data, f, indent=4)
 
         print(f'tiempo total: {time.time() - self.comienzo:.2f} segundos')
@@ -721,8 +716,7 @@ class Backtester:
       
 if __name__ == "__main__":
     inn = time.time()
-    print(pd.read_parquet('output/extrac_os/Ext-011023_EURUSD_20210101_20230101_timeframeH1.parquet'))
-    backtester = Backtester() 
+    backtester = Backtester('EURGBP', 'Asia', 'UP') 
     backtester.run()
     print(f'segundos {time.time()-inn}')
     

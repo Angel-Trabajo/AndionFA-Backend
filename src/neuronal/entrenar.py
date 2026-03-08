@@ -1,6 +1,10 @@
 import numpy as np
 import pandas as pd
 import json
+from src.utils.common_functions import crear_carpeta_si_no_existe
+
+
+
 
 # ----------------------------------------------------------
 # ACTIVACIONES
@@ -181,8 +185,10 @@ def load_trained_model(json_file, input_dim, lr=0.01):
 def predict_from_inputs(nn, input1, input2):
 
     # Asegurar que sean strings
-    input1 = str(input1).zfill(7)
-    input2 = str(input2).zfill(6)
+    input1_raw = str(input1)
+    input2_raw = str(input2)
+    input1 = input1_raw.zfill(7)
+    input2 = input2_raw.zfill(6)
 
     # Convertir cada carácter en bit
     a = np.array([int(bit) for bit in input1], dtype=np.float32)
@@ -190,6 +196,17 @@ def predict_from_inputs(nn, input1, input2):
 
     # Unir
     X = np.concatenate((a, b)).reshape(1, -1)
+
+    expected_dim = nn.W1.shape[0]
+    if X.shape[1] != expected_dim:
+        raise ValueError(
+            "Dimensión de entrada inválida: "
+            f"X={X.shape[1]}, expected={expected_dim}. "
+            f"input1_raw='{input1_raw}' (len={len(input1_raw)}), "
+            f"input2_raw='{input2_raw}' (len={len(input2_raw)}), "
+            f"input1='{input1}' (len={len(input1)}), "
+            f"input2='{input2}' (len={len(input2)})"
+        )
 
     pred = nn.forward(X)[0][0]
 
@@ -222,47 +239,36 @@ def load_data(csv_file):
 
     return X, Y
   
+
+def execute_entrenar(principal_symbol, mercados, list_algorithms = None):
     
+    crear_carpeta_si_no_existe(f'output/{principal_symbol}/data_for_neuronal/model_trainer')
+    list_algorithms = list_algorithms if list_algorithms else ['UP', 'DOWN']
+    
+    for algorithm in list_algorithms:
+        for mercado in mercados:
+            path = f'output/{principal_symbol}/data_for_neuronal/data/data_{mercado}_{algorithm}.csv' 
+            X, Y = load_data(path)
+            print("Datos cargados:")
+            print("X shape:", X.shape)
+            print("Y shape:", Y.shape)
+            nn = BinaryNN(input_dim=X.shape[1], lr=0.01, target_loss=0.10)
+            nn.fit(X, Y, epochs=20000, batch_size=32)
+            # Guardar modelo entrenado
+            model_data = {
+                'W1': nn.W1.tolist(),
+                'b1': nn.b1.tolist(),
+                'W2': nn.W2.tolist(),
+                'b2': nn.b2.tolist(),
+                'W3': nn.W3.tolist(),
+                'b3': nn.b3.tolist(),
+                'W4': nn.W4.tolist(),
+                'b4': nn.b4.tolist()
+            }
+            with open(f'output/{principal_symbol}/data_for_neuronal/model_trainer/model_{mercado}_{algorithm}.json', 'w') as f:
+                json.dump(model_data, f, indent=4)
+            print(f"Modelo entrenado guardado en 'output/{principal_symbol}/data_for_neuronal/model_trainer/model_{mercado}_{algorithm}.json'")
+            
     
 if __name__ == "__main__":
-    
-    with open('config/config_test/config_test_red.json', 'r') as file:
-        config = json.load(file)
-    algorithm = config['algorithm']
-    with open('config/config_crossing/config_crossing.json', 'r') as file:
-        config_crossing = json.load(file)
-        
-    path = f'src/neuronal/data/data_for_neuronal_{algorithm}_{config_crossing["principal_symbol"]}.csv'
-    
-    X, Y = load_data(path)
-    print("Datos cargados:")
-    print("X shape:", X.shape)
-    print("Y shape:", Y.shape)
-    nn = BinaryNN(input_dim=X.shape[1], lr=0.01, target_loss=0.10)
-    nn.fit(X, Y, epochs=20000, batch_size=32)
-    # Guardar modelo entrenado
-    model_data = {
-        'W1': nn.W1.tolist(),
-        'b1': nn.b1.tolist(),
-        'W2': nn.W2.tolist(),
-        'b2': nn.b2.tolist(),
-        'W3': nn.W3.tolist(),
-        'b3': nn.b3.tolist(),
-        'W4': nn.W4.tolist(),
-        'b4': nn.b4.tolist()
-    }
-    with open('src/neuronal/data/model_trained.json', 'w') as f:
-        json.dump(model_data, f, indent=4)
-    print("Modelo entrenado guardado en 'src/neuronal/data/model_trained.json'")
-    
-    # Ejemplo de predicción
-    # 7 + 6
-
-    nn = load_trained_model(
-        "src/neuronal/data/model_trained.json",
-        input_dim=X.shape[1]
-    )
-
-    clase, prob = predict_from_inputs(nn, "0000101", "001011")
-
-    print(clase, prob)
+    pass

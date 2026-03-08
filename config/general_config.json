@@ -1,10 +1,13 @@
 {
     "list_principal_symbols": [
-        "EURJPY",
+        "EURAUD",
         "EURCAD",
         "EURGBP",
+        "EURJPY",
         "EURNZD",
-        "EURUSD"
+        "EURSEK",
+        "EURUSD",
+        "AUDNZD"
     ],
     "indicators_files": [
         "Ext-091614.csv",

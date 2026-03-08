@@ -6,6 +6,9 @@ import subprocess
 import psutil
 import asyncio
 from pathlib import Path
+import time
+import concurrent.futures
+import multiprocessing
 
 
 from fastapi import  APIRouter, HTTPException, BackgroundTasks, Query, WebSocket, WebSocketDisconnect
@@ -19,7 +22,9 @@ from src.scripts.crossing_builder_cpu import execute_crossing_builder
 from dotenv import load_dotenv
 from src.utils.common_functions import crear_carpeta_si_no_existe, get_previous_4_6
 from src.neuronal.data_para_entrenar import execute_data_for_neuronal
-from src.db import query
+from src.neuronal.entrenar import execute_entrenar
+from src.neuronal.backtester import Backtester
+
 
 load_dotenv()
 
@@ -36,6 +41,12 @@ router = APIRouter()
 process = None
 process2 = None
 connected_clients: List[WebSocket] = []
+
+
+def _run_backtester(args: tuple[str, str, str]) -> None:
+    symbol, mercado, algorithm = args
+    backtester = Backtester(symbol, mercado, algorithm)
+    backtester.run()
 
 
 @router.get('/extractor-files')
@@ -102,10 +113,11 @@ async def postnode_config(request: ConfigRequest):
 
 @router.post("/execute-algorithm")
 def execute_algorithm():
-    #query.eliminar_nodos_y_registros()
+    ini = time.time()
     with open(PATH_GENERAL_CONFIG, 'r', encoding='utf8') as file:
         config = json.load(file)
     list_mercado = ['Asia', 'Europa', 'America'] 
+    list_algorithms = ['UP', 'DOWN']
     list_principal_symbols = config['list_principal_symbols']
     timeframe = config['timeframe']
     date_start_os = config['dateStart']
@@ -114,14 +126,25 @@ def execute_algorithm():
     date_start_is, date_end_is = get_previous_4_6(date_start_os, date_end_os)
     
     for symbol in list_principal_symbols:
-        # crear_carpeta_si_no_existe(f'config/divisas/{symbol}')
-        # crear_carpeta_si_no_existe(f'output/{symbol}')
-        # create_files(symbol, timeframe, date_start_os, date_end_os, indicadors_files, 'extrac_os')
-        # create_files(symbol, timeframe, date_start_is, date_end_is, indicadors_files, 'extrac')
-        # execute_node_builder(symbol, list_mercado)
-        # execute_crossing_builder(symbol, list_mercado)
+        crear_carpeta_si_no_existe(f'config/divisas/{symbol}')
+        crear_carpeta_si_no_existe(f'output/{symbol}')
+        create_files(symbol, timeframe, date_start_os, date_end_os, indicadors_files, 'extrac_os')
+        create_files(symbol, timeframe, date_start_is, date_end_is, indicadors_files, 'extrac')
+        execute_node_builder(symbol, list_mercado)
+        execute_crossing_builder(symbol, list_mercado)
         execute_data_for_neuronal(symbol, list_mercado, list_algorithms = None, dict_pips_best= {})  
-        pass
+        execute_entrenar(symbol, list_mercado, list_algorithms = None)
+        tasks = [(symbol, mercado, algorithm) for mercado in list_mercado for algorithm in list_algorithms]
+        max_workers = min(len(tasks), max(1, (os.cpu_count() or 1) // 2))
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_workers,
+            mp_context=multiprocessing.get_context("spawn")
+        ) as executor:
+            futures = [executor.submit(_run_backtester, task) for task in tasks]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+                
+    print(f"Tiempo total de ejecución final: {time.time() - ini:.2f} segundos")    
 
     return {
         "status": "ok",
