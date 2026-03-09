@@ -67,9 +67,7 @@ class Normalizar:
         if signal is None:
             return None
         
-        if len(signal) < 64:
-           count = 6
-        elif len(signal) < 128:
+        if len(signal) < 128:
            count = 7
         else:
             count = 8   
@@ -161,6 +159,7 @@ def execute_data_for_neuronal(principal_symbol, mercados, list_algorithms = None
     crear_carpeta_si_no_existe(f'output/{principal_symbol}/data_for_neuronal')
     crear_carpeta_si_no_existe(f'output/{principal_symbol}/data_for_neuronal/data')
     crear_carpeta_si_no_existe(f'output/{principal_symbol}/data_for_neuronal/maping')
+    crear_carpeta_si_no_existe(f'output/{principal_symbol}/data_for_neuronal/best_score')
     
     with open(f'config/divisas/{principal_symbol}/config_{principal_symbol}.json', 'r', encoding='utf-8') as f:
         config_symbol = json.load(f)

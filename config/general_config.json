@@ -1,13 +1,13 @@
 {
     "list_principal_symbols": [
+        "AUDNZD",
         "EURAUD",
         "EURCAD",
         "EURGBP",
         "EURJPY",
         "EURNZD",
-        "EURSEK",
         "EURUSD",
-        "AUDNZD"
+        "USDJPY"
     ],
     "indicators_files": [
         "Ext-091614.csv",
@@ -42,11 +42,11 @@
     "NTotal": 50,
     "MinOperationsIS": 50,
     "MinOperationsOS": 20,
-    "NumMaxOperations": 4500,
+    "NumMaxOperations": 4000,
     "MinSuccessRate": 0.5,
     "MaxSuccessRate": 0.55,
     "ProgressiveVariation": 0.05,
-    "min_operaciones": 120,
+    "min_operaciones": 150,
     "timeframe": "H1",
     "por_direccion": true
 }

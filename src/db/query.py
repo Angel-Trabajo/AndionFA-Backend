@@ -265,37 +265,36 @@ def eliminar_nodos_y_registros(
             params.append(mercado)
 
         where_clause = " AND ".join(conditions)
+        batch_size = 5000
 
-        cursor.execute(
-            f"""
-            DELETE FROM register_os
-            WHERE node_id IN (
-                SELECT id FROM nodes WHERE {where_clause}
+        while True:
+            cursor.execute(
+                f"SELECT id FROM nodes WHERE {where_clause} LIMIT %s",
+                tuple(params) + (batch_size,)
             )
-            """,
-            tuple(params)
-        )
+            node_ids = [row[0] for row in cursor.fetchall()]
+            if not node_ids:
+                break
 
-        cursor.execute(
-            f"""
-            DELETE FROM register
-            WHERE node_id IN (
-                SELECT id FROM nodes WHERE {where_clause}
+            cursor.execute(
+                "DELETE FROM register_os WHERE node_id = ANY(%s)",
+                (node_ids,)
             )
-            """,
-            tuple(params)
-        )
-
-        cursor.execute(
-            f"DELETE FROM nodes WHERE {where_clause}",
-            tuple(params)
-        )
+            cursor.execute(
+                "DELETE FROM register WHERE node_id = ANY(%s)",
+                (node_ids,)
+            )
+            cursor.execute(
+                "DELETE FROM nodes WHERE id = ANY(%s)",
+                (node_ids,)
+            )
+            conn.commit()
     else:
         cursor.execute("DELETE FROM register_os")
         cursor.execute("DELETE FROM register")
         cursor.execute("DELETE FROM nodes")
+        conn.commit()
 
-    conn.commit()
     release_connection(conn)
     print(f"Nodos y registros han sido eliminados. Filtros aplicados: principal_symbol={principal_symbol}, symbol_cruce={symbol_cruce}, mercado={mercado}")
 

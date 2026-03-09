@@ -43,6 +43,7 @@ class Backtester:
         self.best_score = 0.0
         self.best_model_data = None
         self.peor_trade = 0.0
+        self.info_score = {}
         self.dict_pips_best = {}
         self.data_end = date_end
         self.principal_symbol = principal_symbol
@@ -127,7 +128,7 @@ class Backtester:
                 df_base_for_indicators = df_base_for_indicators.iloc[index_coincidencia-830:]
             print(len(df_base_for_indicators))
             if len(df_base_for_indicators) - 830 > 20:
-                extract_indicadores(df_base_for_indicators)
+                extract_indicadores(self.principal_symbol, df_base_for_indicators)
             
             
         df_base = df_base.sort_values('time').set_index('time')
@@ -135,10 +136,7 @@ class Backtester:
         self.df_train = df_base.iloc[:corte]
         self.df_valid = df_base.iloc[corte:]   
     
-    # ============================================================
-    # FUNCIONES AUXILIARES
-    # ============================================================
-
+  
     def actualizar_dict(self, principal, nuevo_dict):
         """Actualiza dict_pips_best con nuevos datos."""
         for k, v in nuevo_dict.items():
@@ -147,7 +145,7 @@ class Backtester:
             else:
                 # Promedio ponderado (como en TradingEngine.record_trade)
                 principal[k] = (
-                    principal[k] * 0.9 + v * 0.1
+                    principal[k] * 0.8 + v * 0.2
                 )
         
         return principal 
@@ -176,10 +174,7 @@ class Backtester:
                 return False
         return True   
        
-    # ============================================================
-    # OPERADORES Y MAPEINGS
-    # ============================================================
-
+       
     def setup_operators_and_mappings(self):
 
         self.operadores = {
@@ -197,11 +192,7 @@ class Backtester:
         with open(f'output/{self.principal_symbol}/data_for_neuronal/maping/maping_close_{self.mercado}_{self.algorithm}.json', 'r') as file:
             self.maping_close = json.load(file)  
     
-       
-    # ============================================================
-    # CARGA DE NODOS
-    # ============================================================
-
+  
     def load_nodes(self):
 
         self.dict_nodos = {}
@@ -215,26 +206,21 @@ class Backtester:
             get_nodes_by_label(self.principal_symbol, self.principal_symbol, self.mercado, self.other_algorithm)
         )  
        
-    
-    # ============================================================
-    # EXTRAER COLUMNAS NECESARIAS
-    # ============================================================
 
     def extract_required_columns(self):
 
-        self.columnas_usadas = set()
+            self.columnas_usadas = set()
 
-        for symbol in self.dict_nodos:
-            for nodo in self.dict_nodos[symbol]:
+            for symbol in self.dict_nodos:
+                for nodo in self.dict_nodos[symbol]:
+                    for col, _, _ in nodo["conditions"]:
+                        self.columnas_usadas.add(col)
+
+            for nodo in self.nodos_close:
                 for col, _, _ in nodo["conditions"]:
                     self.columnas_usadas.add(col)
-
-        for nodo in self.nodos_close:
-            for col, _, _ in nodo["conditions"]:
-                self.columnas_usadas.add(col)
-
-        self.columnas_usadas.add("time")
-
+            self.columnas_usadas.add("time")
+           
 
     def load_df(self, path):
 
@@ -281,10 +267,6 @@ class Backtester:
             "index_values": df.index.values
         }
         
-        
-    # ============================================================
-    # PRELOAD DATA
-    # ============================================================
 
     def preload_data(self):
 
@@ -332,10 +314,6 @@ class Backtester:
         print(f"Tiempo de carga: {time.time() - ini:.2f} segundos")
         print("Archivos cargados:", len(self.DATA_CACHE))
      
-    
-    # ============================================================
-    # TRAIN ITERATION (IS)
-    # ============================================================
 
     def train_iteration(self):
 
@@ -397,8 +375,9 @@ class Backtester:
                             dict_pips[key] = trade_pips
                         else:
                             dict_pips[key] = (
-                                dict_pips[key] * 0.9 + trade_pips * 0.1
+                                dict_pips[key] * 0.8 + trade_pips * 0.2
                             )
+                            
                         if self.index == 1:
                             clase = random.randint(0, 1)
                         if clase == 1:
@@ -490,11 +469,7 @@ class Backtester:
 
         return model_data
     
-    
-    # ============================================================
-    # VALIDATION (OS)
-    # ============================================================
-
+  
     def validate_iteration(self):
 
         path_data_red = f'output/{self.principal_symbol}/data_for_neuronal/data/data_{self.mercado}_{self.algorithm}.csv'
@@ -657,10 +632,6 @@ class Backtester:
             "mas_perdidas_seguidas": mas_perdidas_seguidas
         }
     
-    
-    # ============================================================
-    # SCORE
-    # ============================================================
 
     def calculate_score(self, metrics, model_data):
 
@@ -685,17 +656,17 @@ class Backtester:
             self.best_score = score
             self.best_model_data = model_data
             self.peor_trade = min(metrics["lista_pips"]) if metrics["lista_pips"] else 0
+            metrics["peor_trade"] = self.peor_trade
+            metrics["score"] = score
+            self.info_score = metrics
             print(f"Nuevo mejor modelo encontrado con score: {score:.4f}")
         return score
-    
-    # ============================================================
-    # RUN LOOP (PARCIAL)
-    # ============================================================
+
 
     def run(self):
         last_model_data = None
 
-        for i in range(40):
+        for i in range(60):
             random.shuffle(self.nodos_close)
             print(f"\n--- Iteración {i+1} ---")
             self.index = i + 1
@@ -709,7 +680,10 @@ class Backtester:
 
         with open(f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.json', 'w') as f:
             json.dump(self.best_model_data, f, indent=4)
-
+        with open(f'output/{self.principal_symbol}/data_for_neuronal/best_score/score_{self.mercado}_{self.algorithm}.json', 'w') as f:
+            json.dump({
+                "metrics": self.info_score
+            }, f, indent=4)
         print(f'tiempo total: {time.time() - self.comienzo:.2f} segundos')
     
        

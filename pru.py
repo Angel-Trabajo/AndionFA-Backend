@@ -1,7 +1,6 @@
 from src.db.query import get_nodes
 
-mercados = ["Asia", "Europa", "America"]
-algorithms = ["UP", "DOWN"]
-symbol = "EURUSD"
-task =  [(symbol, mercado, algorithm) for mercado in mercados for algorithm in algorithms]
-print(task)
+nodes = get_nodes(principal_symbol="EURAUD", symbol_cruce="EURAUD", mercado="Asia", label="UP")
+for node in nodes:
+    print(node)
+print(len(nodes))
