@@ -1,1 +1,47 @@
+malas:
+GBPTRY
+GBPSEK
+GBPNOK
+GBPMXN
+EURTRY
+EURMXN
+EURNOK
 EURSEK
+
+hechas:
+    "AUDCAD",
+    "AUDCHF",
+    "AUDNZD",
+    "AUDUSD",
+    "CADCHF",
+    "CADJPY",
+    "CHFJPY",
+    "EURAUD",
+    "EURCAD",
+    "EURCHF",
+    "EURGBP",
+    "EURJPY",
+    "EURNZD",
+    "EURUSD",
+    "GBPAUD",
+    "GBPCAD",
+    "GBPCHF",
+    "GBPJPY",
+    "GBPNZD",
+    "GBPUSD",
+    "NZDCAD",
+    "NZDCHF",
+    "NZDJPY",
+
+
+faltan:
+    "NZDUSD",
+    "USDCAD",
+    "USDCHF",
+    "USDJPY",
+    "USDMXN",
+    "USDNOK",
+    "USDSEK",
+    "USDSGD",
+    "USDTRY",
+    "AUDJPY"

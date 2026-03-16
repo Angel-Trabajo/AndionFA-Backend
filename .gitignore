@@ -196,4 +196,5 @@ pip-selfcheck.json
 *.json
 *.arff
 *.whl
+*.png
 Ext*.json

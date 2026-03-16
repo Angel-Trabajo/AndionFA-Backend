@@ -31,6 +31,29 @@ from src.neuronal.entrenar import (
     load_data
 )
 
+
+def _max_decimals(series, sample_size=1000):
+    s = series.dropna()
+    if s.empty:
+        return 0
+    if len(s) > sample_size:
+        s = s.sample(sample_size, random_state=0)
+    max_dec = 0
+    for value in s:
+        text = f"{value:.10f}".rstrip('0').rstrip('.')
+        if '.' in text:
+            dec = len(text.split('.')[1])
+            if dec > max_dec:
+                max_dec = dec
+    return max_dec
+
+
+def get_pip_and_point_size(symbol, price_series):
+    digits = _max_decimals(price_series)
+    pip_size = 0.01 if 'JPY' in symbol.upper() else 0.0001
+    point_size = (10 ** (-digits)) if digits > 0 else (pip_size / 10)
+    return pip_size, point_size
+
 class Backtester:
 
     def __init__(self, principal_symbol, mercado, algorithm, date_end=None):
@@ -45,6 +68,9 @@ class Backtester:
         self.peor_trade = 0.0
         self.info_score = {}
         self.dict_pips_best = {}
+        self.min_trades_score = 40
+        self.trade_reliability_k = 120
+        self.low_trade_penalty_power = 1.75
         self.data_end = date_end
         self.principal_symbol = principal_symbol
         self.mercado = mercado
@@ -61,6 +87,10 @@ class Backtester:
         # Cargar sistema
         self.load_config()
         self.prepare_base_data()
+        self.pip_size, self.point_size = get_pip_and_point_size(
+            self.principal_symbol,
+            self.df_train['open'] if 'open' in self.df_train.columns else self.df_valid['open']
+        )
 
         self.setup_operators_and_mappings()
         self.load_nodes()
@@ -266,6 +296,17 @@ class Backtester:
             "col_map": {col: i for i, col in enumerate(df.columns)},
             "index_values": df.index.values
         }
+
+
+    def calculate_trade_pips(self, open_price_open, open_price_close, spread_open):
+        if self.algorithm == 'UP':
+            movement = open_price_close - open_price_open
+        else:
+            movement = open_price_open - open_price_close
+
+        movement_pips = movement / self.pip_size
+        spread_pips = spread_open * self.point_size / self.pip_size
+        return movement_pips - spread_pips
         
 
     def preload_data(self):
@@ -327,6 +368,7 @@ class Backtester:
 
         is_open = False
         open_price_open = 0.0
+        spread_open = 0.0
         sum_pips = 0.0
         entry_red_open = ''
         cierre = 0
@@ -348,6 +390,7 @@ class Backtester:
             # =========================
             if is_open:
                 cierre += 1
+                valid_closes = []
 
                 for nodo in self.nodos_close:
 
@@ -356,37 +399,36 @@ class Backtester:
                     if pos == 0:
                         continue
 
-                    cerrar = False
-
                     if self.cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
-
                         nodo_close = self.maping_close[nodo["key"]]
-
-                        if self.algorithm == 'UP':
-                            trade_pips = open_price - open_price_open
-                        else:
-                            trade_pips = open_price_open - open_price
-
                         clase, prob = predict_from_inputs(nn, entry_red_open, nodo_close)
 
-                        key = f'{entry_red_open}_{nodo_close}'
+                        if self.index == 1:
+                            clase = random.randint(0, 1)
 
+                        valid_closes.append((nodo_close, int(clase)))
+
+                if valid_closes:
+                    trade_pips = self.calculate_trade_pips(
+                        open_price_open,
+                        open_price,
+                        spread_open,
+                    )
+
+                    # Guardar TODOS los nodos de cierre válidos para enriquecer dict_pips
+                    for nodo_close, _ in valid_closes:
+                        key = f'{entry_red_open}_{nodo_close}'
                         if key not in dict_pips:
                             dict_pips[key] = trade_pips
                         else:
-                            dict_pips[key] = (
-                                dict_pips[key] * 0.8 + trade_pips * 0.2
-                            )
-                            
-                        if self.index == 1:
-                            clase = random.randint(0, 1)
-                        if clase == 1:
-                            cerrar = True
+                            dict_pips[key] = dict_pips[key] * 0.8 + trade_pips * 0.2
 
+                    # Cerrar si al menos un nodo válido da clase de cierre
+                    cerrar = any(clase == 1 for _, clase in valid_closes)
                     if cerrar:
                         is_open = False
+                        sum_pips += trade_pips
                         print(f"SUM PIPS: {time_actual}: {sum_pips}", cierre)
-                        break
 
             # =========================
             # APERTURA
@@ -413,6 +455,7 @@ class Backtester:
 
                             if symbol == self.list_symbols[-1]:
                                 open_price_open = open_price
+                                spread_open = getattr(row, 'spread', 0.0)
                                 is_open = True
                                 nodo_open = self.maping_open[nodo["key"]]
                                 entry_red_open = nodo_open
@@ -482,6 +525,7 @@ class Backtester:
 
         is_open = False
         open_price_open = 0.0
+        spread_open = 0.0
         entry_red_open = ''
         cierre = 0
         time_comienzo = None
@@ -528,11 +572,11 @@ class Backtester:
                             cerrar = True
 
                     if cerrar:
-
-                        if self.algorithm == 'UP':
-                            trade_pips = open_price - open_price_open
-                        else:
-                            trade_pips = open_price_open - open_price
+                        trade_pips = self.calculate_trade_pips(
+                            open_price_open,
+                            open_price,
+                            spread_open,
+                        )
 
                         if trade_pips < 0:
                             perdidas_seguidas += 1
@@ -580,6 +624,7 @@ class Backtester:
 
                             if symbol == self.list_symbols[-1]:
                                 open_price_open = open_price
+                                spread_open = getattr(row, 'spread', 0.0)
                                 is_open = True
                                 time_comienzo = time_actual
                                 nodo_open = self.maping_open[nodo["key"]]
@@ -637,6 +682,7 @@ class Backtester:
 
         profit_factor_adj = min(metrics["profit_factor"], 5)
         sharpe_adj = min(metrics["sharpe"], 3)
+        n_ops = metrics["cantidad_operaciones"]
 
         score_base = (
             (metrics["expectancy"] * 2.0) +
@@ -645,11 +691,18 @@ class Backtester:
             (metrics["winrate"] * 1.0)
         )
 
-        penalizacion = np.log(metrics["cantidad_operaciones"] + 1)
+        volumen_factor = np.log(n_ops + 1)
+        reliability_factor = n_ops / (n_ops + self.trade_reliability_k) if n_ops > 0 else 0.0
+        min_trades_factor = min(1.0, n_ops / self.min_trades_score) if self.min_trades_score > 0 else 1.0
+        low_trade_penalty = min_trades_factor ** self.low_trade_penalty_power
 
-        score = score_base * penalizacion
+        score = score_base * volumen_factor * reliability_factor * low_trade_penalty
 
-        print(f"Score calculado: {score:.4f}")
+        print(
+            f"Score calculado: {score:.4f} | base={score_base:.4f} | ops={n_ops} | "
+            f"vol={volumen_factor:.4f} | rel={reliability_factor:.4f} | "
+            f"low_ops={low_trade_penalty:.4f}"
+        )
 
         if score > self.best_score:
 
@@ -657,7 +710,12 @@ class Backtester:
             self.best_model_data = model_data
             self.peor_trade = min(metrics["lista_pips"]) if metrics["lista_pips"] else 0
             metrics["peor_trade"] = self.peor_trade
+            metrics["iteracion"] = self.index
             metrics["score"] = score
+            metrics["score_base"] = score_base
+            metrics["volumen_factor"] = volumen_factor
+            metrics["reliability_factor"] = reliability_factor
+            metrics["low_trade_penalty"] = low_trade_penalty
             self.info_score = metrics
             print(f"Nuevo mejor modelo encontrado con score: {score:.4f}")
         return score
@@ -666,7 +724,7 @@ class Backtester:
     def run(self):
         last_model_data = None
 
-        for i in range(60):
+        for i in range(40):
             random.shuffle(self.nodos_close)
             print(f"\n--- Iteración {i+1} ---")
             self.index = i + 1
@@ -690,7 +748,7 @@ class Backtester:
       
 if __name__ == "__main__":
     inn = time.time()
-    backtester = Backtester('EURGBP', 'Asia', 'UP') 
+    backtester = Backtester('AUDCAD', 'Asia', 'DOWN', date_end=None) 
     backtester.run()
     print(f'segundos {time.time()-inn}')
     

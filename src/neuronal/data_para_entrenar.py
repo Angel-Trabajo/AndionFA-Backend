@@ -178,5 +178,5 @@ def execute_data_for_neuronal(principal_symbol, mercados, list_algorithms = None
     
     
 if __name__ == "__main__":
-    pass
+    execute_data_for_neuronal('AUDCAD', ['Asia'], list_algorithms = None, dict_pips_best= {})
       

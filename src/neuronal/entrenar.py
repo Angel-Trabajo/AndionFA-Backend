@@ -1,6 +1,9 @@
+import os
+import sys
 import numpy as np
 import pandas as pd
 import json
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from src.utils.common_functions import crear_carpeta_si_no_existe
 
 
@@ -271,4 +274,4 @@ def execute_entrenar(principal_symbol, mercados, list_algorithms = None):
             
     
 if __name__ == "__main__":
-    pass
+    execute_entrenar('AUDCAD', ['Asia'], list_algorithms = None)

@@ -132,17 +132,17 @@ def execute_algorithm():
         create_files(symbol, timeframe, date_start_is, date_end_is, indicadors_files, 'extrac')
         execute_node_builder(symbol, list_mercado)
         execute_crossing_builder(symbol, list_mercado)
-        execute_data_for_neuronal(symbol, list_mercado, list_algorithms = None, dict_pips_best= {})  
-        execute_entrenar(symbol, list_mercado, list_algorithms = None)
-        tasks = [(symbol, mercado, algorithm) for mercado in list_mercado for algorithm in list_algorithms]
-        max_workers = min(len(tasks), max(1, (os.cpu_count() or 1) // 2))
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=max_workers,
-            mp_context=multiprocessing.get_context("spawn")
-        ) as executor:
-            futures = [executor.submit(_run_backtester, task) for task in tasks]
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
+        # execute_data_for_neuronal(symbol, list_mercado, list_algorithms = None, dict_pips_best= {})  
+        # execute_entrenar(symbol, list_mercado, list_algorithms = None)
+        # tasks = [(symbol, mercado, algorithm) for mercado in list_mercado for algorithm in list_algorithms]
+        # max_workers = min(len(tasks), max(1, (os.cpu_count() or 1) // 2))
+        # with concurrent.futures.ProcessPoolExecutor(
+        #     max_workers=max_workers,
+        #     mp_context=multiprocessing.get_context("spawn")
+        # ) as executor:
+        #     futures = [executor.submit(_run_backtester, task) for task in tasks]
+        #     for future in concurrent.futures.as_completed(futures):
+        #         future.result()
                 
     print(f"Tiempo total de ejecución final: {time.time() - ini:.2f} segundos")    
 

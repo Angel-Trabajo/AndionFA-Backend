@@ -501,8 +501,8 @@ def create_trees(symbol, action, cont, prev_os, prev_is, NumMaxOperations, merca
     porcent_aumento_is =calcular_porcentage(symbol, prev_is, config)
     
     MAX_PROCESOS = len(list_files) # ajustable según CPU
-    if MAX_PROCESOS > 25:
-        MAX_PROCESOS = 25
+    if MAX_PROCESOS > 20:
+        MAX_PROCESOS = 20
     
     with ProcessPoolExecutor(
         max_workers=MAX_PROCESOS,
