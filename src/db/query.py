@@ -356,22 +356,41 @@ def get_dates_by_label(principal_symbol, symbol_cruce, mercado, label, modo="is"
     return results
 
 
-def get_nodes(principal_symbol, symbol_cruce, mercado, label):
+def get_nodes(principal_symbol, symbol_cruce, mercado=None, label=None):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT * FROM nodes WHERE label = %s AND principal_symbol = %s AND symbol_cruce = %s AND mercado = %s', (label, principal_symbol, symbol_cruce, mercado))
+
+    if mercado is None:
+        cursor.execute(
+            'SELECT * FROM nodes WHERE label = %s AND principal_symbol = %s AND symbol_cruce = %s',
+            (label, principal_symbol, symbol_cruce)
+        )
+    else:
+        cursor.execute(
+            'SELECT * FROM nodes WHERE label = %s AND principal_symbol = %s AND symbol_cruce = %s AND mercado = %s',
+            (label, principal_symbol, symbol_cruce, mercado)
+        )
+
     res = cursor.fetchall()
     release_connection(conn)
     return res if res else None
 
-def get_nodes_by_label(principal_symbol, symbol_cruce, mercado, label):
+
+def get_nodes_by_label(principal_symbol, symbol_cruce, mercado=None, label=None):
     conn = get_connection()
     cursor = conn.cursor()
 
     # Buscar todos los registros de la tabla 'nodes'
-    cursor.execute(
-        'SELECT conditions, file_in_db FROM nodes WHERE label = %s AND principal_symbol = %s AND symbol_cruce = %s AND mercado = %s', 
-        (label, principal_symbol, symbol_cruce, mercado))
+    if mercado is None:
+        cursor.execute(
+            'SELECT conditions, file_in_db FROM nodes WHERE label = %s AND principal_symbol = %s AND symbol_cruce = %s',
+            (label, principal_symbol, symbol_cruce)
+        )
+    else:
+        cursor.execute(
+            'SELECT conditions, file_in_db FROM nodes WHERE label = %s AND principal_symbol = %s AND symbol_cruce = %s AND mercado = %s',
+            (label, principal_symbol, symbol_cruce, mercado)
+        )
     resultados = cursor.fetchall()
 
     release_connection(conn)

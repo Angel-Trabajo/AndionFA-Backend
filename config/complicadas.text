@@ -7,9 +7,11 @@ EURTRY
 EURMXN
 EURNOK
 EURSEK
+"USDMXN",
+"USDNOK",
+"USDSGD",
 
 hechas:
-    "AUDCAD",
     "AUDCHF",
     "AUDNZD",
     "AUDUSD",
@@ -32,16 +34,16 @@ hechas:
     "NZDCAD",
     "NZDCHF",
     "NZDJPY",
-
-
-faltan:
     "NZDUSD",
     "USDCAD",
     "USDCHF",
     "USDJPY",
-    "USDMXN",
-    "USDNOK",
-    "USDSEK",
-    "USDSGD",
+    "USDSEK"
+
+faltan:
+    "AUDJPY",
+    "AUDCAD",
     "USDTRY",
-    "AUDJPY"
+    "AUDCHF",
+    "AUDNZD"
+    

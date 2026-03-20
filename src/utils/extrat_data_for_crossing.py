@@ -19,7 +19,7 @@ from src.utils.common_functions import get_previous_4_6, crear_carpeta_si_no_exi
 
 list_symbol_bruto = peticiones.get_active_symbols()
 _mapping_time = peticiones.get_timeframes()
-list_malas = ["EURMXN","EURNOK","EURSEK"]  # Ejemplo de símbolo a eliminar, se puede ajustar según necesidades
+list_malas = ["EURMXN","EURNOK","EURSEK","USDMXN","USDNOK"]  # Ejemplo de símbolo a eliminar, se puede ajustar según necesidades
 for mala in list_malas:
     if mala in list_symbol_bruto:
         list_symbol_bruto.remove(mala)

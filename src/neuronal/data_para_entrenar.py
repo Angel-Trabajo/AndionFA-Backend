@@ -41,7 +41,7 @@ class Signal:
         nodes = db_query.get_nodes(
             principal_symbol=self.principal_symbol, 
             symbol_cruce=self.principal_symbol, 
-            mercado=self.mercado, 
+            mercado=None, 
             label=self.other_algorithm
             )
         return [(n[6]) for n in nodes] if nodes else None
@@ -50,7 +50,7 @@ class Signal:
         nodes = db_query.get_nodes(
             principal_symbol=self.principal_symbol, 
             symbol_cruce=self.last_symbol, 
-            mercado=self.mercado, 
+            mercado=None, 
             label=self.algorithm
             )
         return [n[6] for n in nodes] if nodes else None
@@ -67,10 +67,8 @@ class Normalizar:
         if signal is None:
             return None
         
-        if len(signal) < 128:
-           count = 7
-        else:
-            count = 8   
+        
+        count = 8   
         asign = {}
         for i, elem in enumerate(signal):
             # Normalizar siempre
@@ -91,10 +89,7 @@ class Normalizar:
         if signal is None:
             return None
         
-        if len(signal) < 128:
-           count = 7
-        else:
-            count = 8
+        count = 8
         asign = {}
 
         for i, elem in enumerate(signal):
@@ -124,7 +119,11 @@ operadores = {
 }
 
 
-def data_for_neuronal(config, mercado, algorithm, dict_pips_best= {}):
+def data_for_neuronal(config, mercado, algorithm, dict_pips_best=None, trade_samples=None):
+    if dict_pips_best is None:
+        dict_pips_best = {}
+    if trade_samples is None:
+        trade_samples = []
     
     principal_symbol = config['principal_symbol']
     signal = Signal(algorithm, principal_symbol, mercado, config)
@@ -134,25 +133,127 @@ def data_for_neuronal(config, mercado, algorithm, dict_pips_best= {}):
     data = {
         'input1': [],
         'input2': [],
-        'output': []
+        'time_open': [],
+        'time_close': [],
+        'atr': [],
+        'adx': [],
+        'rsi': [],
+        'stoch': [],
+        'hour': [],
+        'spread': [],
+        'atr_open': [],
+        'adx_open': [],
+        'rsi_open': [],
+        'stoch_open': [],
+        'output': [],
+        # Nuevos campos para Cambio 2: Tracking de decisiones
+        'executed': [],
+        'reason': [],
     }
-    for j, open in enumerate(sign_open.values()):
-        for i, close in enumerate(sign_close.values()):
-            if f'{open}_{close}' in dict_pips_best:
-                if dict_pips_best[f'{open}_{close}'] > 0:
-                    valor = 1
-                else:
-                    valor = 0
-            else:
-                if i > 0 or j > 0:
-                    continue
-                valor = 0
-            data['input1'].append(open)
-            data['input2'].append(close)
-            data['output'].append(valor)
-            
+
+    if not trade_samples:
+        print(f"[data_for_neuronal] Sin trade_samples para {mercado}/{algorithm}, saltando generación de dataset.")
+        return
+
+    MIN_ABS_PIPS = 2.0
+    print(f"[data_for_neuronal] Samples antes de filtrar: {len(trade_samples)}")
+    skipped_micro = 0
+
+    for sample in trade_samples:
+        open_signal = str(sample.get('open_signal', ''))
+        close_signal = str(sample.get('close_signal', ''))
+
+        if not open_signal or not close_signal:
+            continue
+
+        profit = float(sample.get('profit', 0.0) or 0.0)  # target futuro (MFE-|MAE|)
+        profit_real = float(sample.get('profit_real', profit) or 0.0)  # pips reales ejecutados
+        if abs(profit_real) < MIN_ABS_PIPS:
+            skipped_micro += 1
+            continue
+
+        data['input1'].append(open_signal)
+        data['input2'].append(close_signal)
+        data['time_open'].append(str(sample.get('time_open', '') or ''))
+        data['time_close'].append(str(sample.get('time_close', '') or ''))
+        data['atr'].append(float(sample.get('atr', 0.0) or 0.0))
+        data['adx'].append(float(sample.get('adx', 0.0) or 0.0))
+        data['rsi'].append(float(sample.get('rsi', 0.0) or 0.0))
+        data['stoch'].append(float(sample.get('stoch', 50.0) or 50.0))
+        data['hour'].append(float(sample.get('hour', 0.0) or 0.0))
+        data['spread'].append(float(sample.get('spread', 0.0) or 0.0))
+        data['atr_open'].append(float(sample.get('atr_open', 0.0) or 0.0))
+        data['adx_open'].append(float(sample.get('adx_open', 0.0) or 0.0))
+        data['rsi_open'].append(float(sample.get('rsi_open', 0.0) or 0.0))
+        data['stoch_open'].append(float(sample.get('stoch_open', 50.0) or 50.0))
+
+        # Target continuo lineal (sin tanh) para preservar resolución
+        profit_scaled = float(profit / 50.0)
+        data['output'].append(profit_scaled)
+        
+        # Nuevos campos: tracking de decisión
+        data['executed'].append(int(sample.get('executed', 0)))  # 1 si fue ejecutada
+        data['reason'].append(str(sample.get('reason', 'UNKNOWN') or 'UNKNOWN'))  # Razón del cierre
+
     df = pd.DataFrame(data)
-    df.to_csv(f'output/{principal_symbol}/data_for_neuronal/data/data_{mercado}_{algorithm}.csv', index=False)
+    if df.empty:
+        print(f"[data_for_neuronal] ⚠️ Dataset vacío para {mercado}/{algorithm}, no se guarda")
+        return
+
+    required_cols = [
+        'input1', 'input2', 'time_open', 'time_close', 'atr', 'adx', 'rsi', 'stoch', 'hour', 'spread',
+        'atr_open', 'adx_open', 'rsi_open', 'stoch_open', 'output',
+        # Nuevas columnas para Cambio 2
+        'executed', 'reason'
+    ]
+    for col in required_cols:
+        if col not in df.columns:
+            if col in ['input1', 'input2', 'time_open', 'time_close', 'reason']:
+                df[col] = ''
+            else:
+                df[col] = 0.0 if col not in ['executed'] else 0
+
+    # Mantener solo decisiones realmente ejecutadas para evitar contaminación de labels
+    if 'executed' in df.columns:
+        df = df[df['executed'].astype(int) == 1]
+        if df.empty:
+            print(f"[data_for_neuronal] ⚠️ Sin filas ejecutadas para {mercado}/{algorithm}, no se guarda")
+            return
+
+    print(f"[data_for_neuronal] Micro trades descartados (<{MIN_ABS_PIPS} pip): {skipped_micro}")
+    print(f"[data_for_neuronal] Samples después de filtrar: {len(df)}")
+    dataset_path = f'output/{principal_symbol}/data_for_neuronal/data/data_{mercado}_{algorithm}.csv'
+    df = df[required_cols]
+
+    # Si hay histórico, hacer merge para evitar overwrite destructivo.
+    if os.path.exists(dataset_path):
+        try:
+            old_df = pd.read_csv(dataset_path)
+            for col in required_cols:
+                if col not in old_df.columns:
+                    old_df[col] = '' if col in ['input1', 'input2', 'time_open', 'time_close'] else 0.0
+            old_df = old_df[required_cols]
+            merged = pd.concat([old_df, df], ignore_index=True)
+        except Exception as e:
+            print(f"[data_for_neuronal] ⚠️ No se pudo leer dataset previo, se reemplaza ({e})")
+            merged = df.copy()
+    else:
+        merged = df.copy()
+
+    # Deduplicar preferentemente por fecha de cierre + señales.
+    dedupe_keys = ['time_close', 'input1', 'input2']
+    if all(k in merged.columns for k in dedupe_keys):
+        merged = merged.drop_duplicates(subset=dedupe_keys, keep='last')
+    else:
+        merged = merged.drop_duplicates(keep='last')
+
+    # Si es primer archivo y todavía no hay masa crítica, evitar crear dataset débil.
+    if not os.path.exists(dataset_path) and len(merged) < 5:
+        print(f"[data_for_neuronal] ⚠️ Muy pocos samples iniciales ({len(merged)}), no se guarda dataset aún")
+        return
+
+    merged.to_csv(dataset_path, index=False)
+    print(f"[data_for_neuronal] Dataset guardado: {dataset_path} | filas={len(merged)}")
 
 
 def execute_data_for_neuronal(principal_symbol, mercados, list_algorithms = None, dict_pips_best= {}):

@@ -1,8 +1,5 @@
 {
     "list_principal_symbols": [
-        "AUDCAD",
-        "AUDCHF",
-        "AUDNZD",
         "AUDUSD",
         "CADCHF",
         "CADJPY",
@@ -22,7 +19,12 @@
         "GBPUSD",
         "NZDCAD",
         "NZDCHF",
-        "NZDJPY"
+        "NZDJPY",
+        "NZDUSD",
+        "USDCAD",
+        "USDCHF",
+        "USDJPY",
+        "USDSEK"
     ],
     "indicators_files": [
         "Ext-011616.csv",

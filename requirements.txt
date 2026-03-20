@@ -140,3 +140,4 @@ weka==2.0.2
 widgetsnbextension==4.0.14
 yarl==1.20.1
 yfinance==0.2.65
+xgboost==2.1.4

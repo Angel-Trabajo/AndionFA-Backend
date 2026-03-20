@@ -1,6 +1,7 @@
 from src.db.query import get_nodes
+import pandas as pd
 
-nodes = get_nodes(principal_symbol="EURAUD", symbol_cruce="EURAUD", mercado="Asia", label="UP")
-for node in nodes:
-    print(node)
-print(len(nodes))
+df = pd.read_parquet('output/AUDCAD/extrac_os/Ext-011616_AUDCAD_20200101_20230101_timeframeH1.parquet')
+df.head(1).to_csv('esta.csv', index=False)
+
+print(df)
