@@ -1,4 +1,7 @@
+import json
 import logging
+from pathlib import Path
+
 from psycopg2.extras import execute_values
 from src.db.postgres import get_connection, release_connection
 
@@ -9,6 +12,23 @@ if not logger.handlers:
         level=logging.INFO,
         format='%(asctime)s %(levelname)s %(name)s - %(message)s'
     )
+
+
+GENERAL_CONFIG_PATH = Path(__file__).resolve().parents[2] / 'config' / 'general_config.json'
+
+
+def _get_allowed_indicator_files() -> set[str] | None:
+    try:
+        with GENERAL_CONFIG_PATH.open('r', encoding='utf8') as file:
+            data = json.load(file)
+    except Exception as exc:
+        logger.warning('No se pudo cargar general_config para filtrar extractores: %s', exc)
+        return None
+
+    indicators_files = data.get('indicators_files')
+    if not indicators_files:
+        return None
+    return set(indicators_files)
 
 
 def insertar_nodo_con_registros(
@@ -248,55 +268,66 @@ def eliminar_nodos_y_registros(
     conn = get_connection()
     cursor = conn.cursor()
 
-    has_filters = any([principal_symbol, symbol_cruce, mercado])
+    try:
+        has_filters = any([principal_symbol, symbol_cruce, mercado])
 
-    if has_filters:
+        if not has_filters:
+            cursor.execute("TRUNCATE TABLE register_os, register, nodes")
+            conn.commit()
+            print(
+                "Nodos y registros han sido eliminados. "
+                "Filtros aplicados: principal_symbol=None, symbol_cruce=None, mercado=None"
+            )
+            return
+
         conditions = []
         params = []
 
         if principal_symbol:
-            conditions.append("principal_symbol = %s")
+            conditions.append("n.principal_symbol = %s")
             params.append(principal_symbol)
         if symbol_cruce:
-            conditions.append("symbol_cruce = %s")
+            conditions.append("n.symbol_cruce = %s")
             params.append(symbol_cruce)
         if mercado:
-            conditions.append("mercado = %s")
+            conditions.append("n.mercado = %s")
             params.append(mercado)
 
-        where_clause = " AND ".join(conditions)
-        batch_size = 5000
+        where_clause = " AND ".join(conditions) if conditions else "TRUE"
 
-        while True:
-            cursor.execute(
-                f"SELECT id FROM nodes WHERE {where_clause} LIMIT %s",
-                tuple(params) + (batch_size,)
+        cursor.execute(
+            f"""
+            WITH target_nodes AS (
+                SELECT n.id
+                FROM nodes n
+                WHERE {where_clause}
+            ),
+            deleted_register_os AS (
+                DELETE FROM register_os ro
+                USING target_nodes tn
+                WHERE ro.node_id = tn.id
+                RETURNING ro.node_id
+            ),
+            deleted_register AS (
+                DELETE FROM register r
+                USING target_nodes tn
+                WHERE r.node_id = tn.id
+                RETURNING r.node_id
             )
-            node_ids = [row[0] for row in cursor.fetchall()]
-            if not node_ids:
-                break
-
-            cursor.execute(
-                "DELETE FROM register_os WHERE node_id = ANY(%s)",
-                (node_ids,)
-            )
-            cursor.execute(
-                "DELETE FROM register WHERE node_id = ANY(%s)",
-                (node_ids,)
-            )
-            cursor.execute(
-                "DELETE FROM nodes WHERE id = ANY(%s)",
-                (node_ids,)
-            )
-            conn.commit()
-    else:
-        cursor.execute("DELETE FROM register_os")
-        cursor.execute("DELETE FROM register")
-        cursor.execute("DELETE FROM nodes")
+            DELETE FROM nodes n
+            USING target_nodes tn
+            WHERE n.id = tn.id
+            """,
+            tuple(params)
+        )
         conn.commit()
 
-    release_connection(conn)
-    print(f"Nodos y registros han sido eliminados. Filtros aplicados: principal_symbol={principal_symbol}, symbol_cruce={symbol_cruce}, mercado={mercado}")
+        print(
+            f"Nodos y registros han sido eliminados. Filtros aplicados: "
+            f"principal_symbol={principal_symbol}, symbol_cruce={symbol_cruce}, mercado={mercado}"
+        )
+    finally:
+        release_connection(conn)
 
 
 def promedio_correct_percentage(principal_symbol, symbol_cruce, mercado, label, modo):
@@ -394,6 +425,16 @@ def get_nodes_by_label(principal_symbol, symbol_cruce, mercado=None, label=None)
     resultados = cursor.fetchall()
 
     release_connection(conn)
+    if not resultados:
+        return None
+
+    allowed_indicator_files = _get_allowed_indicator_files()
+    if allowed_indicator_files is not None:
+        resultados = [
+            result for result in resultados
+            if f"{str(result[1]).split('_')[0]}.csv" in allowed_indicator_files
+        ]
+
     if not resultados:
         return None
     return resultados

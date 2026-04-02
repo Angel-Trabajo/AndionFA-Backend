@@ -109,19 +109,28 @@ def selecte_nodes(file: str, op_down, op_up, symbol, list_nodos, mercado):
     if not dire:
         return
     
-    df_indicators_os = pd.read_parquet(f'output/{symbol}/extrac_os/{dire}')
-    df_indicators_is = pd.read_parquet(f'output/{symbol}/extrac/{file}')
-    df_os = pd.read_csv(f'output/{symbol}/is_os/os.csv')
-    df_is = pd.read_csv(f'output/{symbol}/is_os/is.csv')
     
-    # Convertir columnas time a datetime (una vez)
+    indicators_is = pd.read_parquet(f'output/{symbol}/extrac/{file}')
+    # Convertir time a datetime ANTES de slice/copy
+    if 'time' in indicators_is.columns and not pd.api.types.is_datetime64_any_dtype(indicators_is['time']):
+        indicators_is['time'] = pd.to_datetime(indicators_is['time'])
+    
+    df_indicators_os = indicators_is.iloc[int(len(indicators_is)*0.8):].copy()  # Para no modificar el original
+    df_indicators_is = indicators_is.iloc[:int(len(indicators_is)*0.8)].copy()  # Para no modificar el original
+    
+    df_bas = pd.read_csv(f'output/{symbol}/is_os/is.csv')
+    # Convertir time a datetime ANTES de slice/copy
+    if 'time' in df_bas.columns and not pd.api.types.is_datetime64_any_dtype(df_bas['time']):
+        df_bas['time'] = pd.to_datetime(df_bas['time'])
+    
+    df_os = df_bas.iloc[int(len(df_bas)*0.8):].copy()  # Para no modificar el original
+    df_is = df_bas.iloc[:int(len(df_bas)*0.8)].copy()
+    
+    # Calcular hora para todos los DataFrames (ahora time es datetime garantizado)
     for df in [df_os, df_is, df_indicators_os, df_indicators_is]:
-        if 'time' in df.columns:
-            if not pd.api.types.is_datetime64_any_dtype(df['time']):
-                df['time'] = pd.to_datetime(df['time'])
-
+        if 'time' in df.columns and pd.api.types.is_datetime64_any_dtype(df['time']):
             # ⭐ PRECALCULO CRÍTICO
-            df['hour'] = df['time'].dt.hour
+            df.loc[:, 'hour'] = df['time'].dt.hour
             
     # ===== FILTRO MERCADO SEGURO =====
 
@@ -325,7 +334,8 @@ def selecte_nodes(file: str, op_down, op_up, symbol, list_nodos, mercado):
 def procesar_archivo(file: str, symbol, mercado):
     try:
         df = pd.read_parquet(f"output/{symbol}/extrac/{file}")
-        node_generator = NodeGenerator(df)
+        df_generator = df.iloc[:int(len(df)*0.2)].copy()  # Para no modificar el original
+        node_generator = NodeGenerator(df_generator)
         operaciones_exitosas_UP = 0
         operaciones_exitosas_DOWN = 0
         while operaciones_exitosas_UP < config['NumMaxOperations'] or operaciones_exitosas_DOWN < config['NumMaxOperations']:
@@ -345,10 +355,7 @@ def procesar_archivo(file: str, symbol, mercado):
 
 def execute_node_builder(symbol, mercados):  
     peticiones.initialize_mt5()
-    
-    for mercado in mercados:
-        db_query.eliminar_nodos_y_registros(principal_symbol=symbol, symbol_cruce=symbol, mercado=mercado)
-        
+         
     list_files = os.listdir(f'output/{symbol}/extrac')
     
     

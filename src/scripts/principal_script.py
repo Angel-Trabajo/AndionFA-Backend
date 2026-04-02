@@ -12,7 +12,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")
 
 from src.routes import peticiones
 from src.db.query import get_nodes_by_label
-from src.neuronal.entrenar import load_trained_model, load_data, predict_from_inputs, BinaryNN
+from src.neuronal.entrenar import load_trained_model, load_data, predict_from_inputs, BinaryNN, save_trained_model, get_embedding_vocab_sizes, validate_embedding_vocab
 from src.neuronal.backtester import Backtester
 from src.neuronal.data_para_entrenar import data_for_neuronal
 from src.utils.indicadores_for_principal_script import generate_files
@@ -32,7 +32,7 @@ PATH_LIST_SYMBOLS = 'config/list_{}.json'
 PATH_CONFIG_CROSSING = 'config/config_crossing/config_crossing.json'
 PATH_DATA_TEST = 'output/test_neuronal/'
 PATH_DATA_FOR_NEURONAL = 'src/neuronal/data/data_for_neuronal_{}_{}.csv'
-PATH_MODEL_TRAINED = "src/neuronal/data/model_trained.json"
+PATH_MODEL_TRAINED = "src/neuronal/data/model_trained.pt"
 PATH_MAPPING_OPEN = 'src/neuronal/data/maping_open.json'
 PATH_MAPPING_CLOSE = 'src/neuronal/data/maping_close.json'
 PATH_BEST_SCORE = 'src/neuronal/data/best_score.json'
@@ -241,12 +241,13 @@ class TradingServer:
             PATH_DATA_FOR_NEURONAL.format(self.algorithm, self.principal_symbol)
         )
 
-        X, Y = load_data(self.path_for_neuronal)
+        input1_ids, input2_ids, hour_ids, X_extra, Y = load_data(self.path_for_neuronal)
 
         self.nn = load_trained_model(
             PATH_MODEL_TRAINED,
-            input_dim=X.shape[1]
+            input_dim_extra=X_extra.shape[1]
         )
+        validate_embedding_vocab(self.nn, input1_ids, input2_ids, hour_ids)
 
         with open(PATH_MAPPING_OPEN, 'r') as file:
             self.maping_open = json.load(file)
@@ -257,10 +258,13 @@ class TradingServer:
         with open(PATH_BEST_SCORE, 'r') as file:
             self.best_score = json.load(file)
 
-        self.dict_pips_best = self.best_score['dict_pips_best']
+        self.best_score_metrics = self.best_score.get('metrics', self.best_score)
+        self.close_threshold = self.best_score_metrics.get('best_threshold', 0.5)
+
+        self.dict_pips_best = self.best_score.get('dict_pips_best', self.best_score_metrics.get('dict_pips_best', {}))
 
         self.numero_iteracion_for_evalution = (
-            self.best_score['mas_perdidas_seguidas'] * MULTIPLICADOR_OPERACIONES_PARA_EVALUACION
+            self.best_score_metrics.get('mas_perdidas_seguidas', 0) * MULTIPLICADOR_OPERACIONES_PARA_EVALUACION
         )
         
         
@@ -277,10 +281,12 @@ class TradingServer:
             if cumple_condiciones(row, nodo["conditions"]):
 
                 self.nodo_close = self.maping_close[nodo["key"]]
-                clase, prob = predict_from_inputs(
+                hour = format(pd.to_datetime(row.time).hour, "05b") if hasattr(row, 'time') else format(0, "05b")
+                prob = predict_from_inputs(
                     self.nn,
                     self.nodo_open,
-                    self.nodo_close
+                    self.nodo_close,
+                    hour
                 )
 
                 if self.algorithm == 'UP':
@@ -297,7 +303,7 @@ class TradingServer:
                         self.dict_pips[key] * 0.9 + trade_pips * 0.1
                     )
 
-                if clase == 1:
+                if prob < self.close_threshold:
                     cerrar = True
 
             if cerrar:
@@ -381,7 +387,7 @@ class TradingServer:
 
         if (
             self.perdidas_seguidas
-            > self.best_score['mas_perdidas_seguidas']
+            > self.best_score_metrics.get('mas_perdidas_seguidas', 0)
             and self.neuro_evaluation
         ):
 
@@ -401,7 +407,7 @@ class TradingServer:
 
         if (
             self.perdidas_seguidas
-            >= self.best_score['mas_perdidas_seguidas']
+            >= self.best_score_metrics.get('mas_perdidas_seguidas', 0)
         ):
 
             interv = int(len(self.dict_pips) / 8)
@@ -439,46 +445,37 @@ class TradingServer:
                 self.dict_pips_best
             )
 
-            X, Y = load_data(self.path_for_neuronal)
+            input1_ids, input2_ids, hour_ids, X_extra, Y, norm_stats = load_data(self.path_for_neuronal, return_stats=True)
 
             print("Datos cargados:")
-            print("X shape:", X.shape)
+            print("X_extra shape:", X_extra.shape)
             print("Y shape:", Y.shape)
 
+            num_open, num_close, num_hours = get_embedding_vocab_sizes(input1_ids, input2_ids, hour_ids)
             nn = BinaryNN(
-                input_dim=X.shape[1],
-                lr=0.01,
+                input_dim_extra=X_extra.shape[1],
+                num_open=num_open,
+                num_close=num_close,
+                num_hours=num_hours,
+                lr=0.001,
                 target_loss=0.10
             )
+            nn.feature_mean = norm_stats["mean"]
+            nn.feature_std = norm_stats["std"]
 
-            nn.fit(X, Y, epochs=20000, batch_size=32)
-
-            model_data = {
-                'W1': nn.W1.tolist(),
-                'b1': nn.b1.tolist(),
-                'W2': nn.W2.tolist(),
-                'b2': nn.b2.tolist(),
-                'W3': nn.W3.tolist(),
-                'b3': nn.b3.tolist(),
-                'W4': nn.W4.tolist(),
-                'b4': nn.b4.tolist()
-            }
-
-            with open(
-                'src/neuronal/data/model_trained.json',
-                'w'
-            ) as f:
-                json.dump(model_data, f, indent=4)
+            nn.fit(input1_ids, input2_ids, hour_ids, X_extra, Y, epochs=200, batch_size=32)
+            save_trained_model(nn, PATH_MODEL_TRAINED)
 
             print(
                 "Modelo entrenado guardado en "
-                "'src/neuronal/data/model_trained.json'"
+                f"'{PATH_MODEL_TRAINED}'"
             )
 
             self.nn = load_trained_model(
-                "src/neuronal/data/model_trained.json",
-                input_dim=X.shape[1]
+                PATH_MODEL_TRAINED,
+                input_dim_extra=X_extra.shape[1]
             )
+            validate_embedding_vocab(self.nn, input1_ids, input2_ids, hour_ids)
 
             self.neuro_evaluation = True
             with open(PATH_CONT_EVOLUTION, 'r') as file:

@@ -75,6 +75,32 @@ def _create_label(df):
     df["label"] = np.where(df["open"] > df["close"], 1, -1)
     return df   
 
+
+def _create_future_return_target(df, horizon=5, atr_column="ATR_14"):
+    target_df = df.copy()
+    close = pd.to_numeric(target_df.get("close"), errors="coerce")
+
+    if atr_column in target_df.columns:
+        atr = pd.to_numeric(target_df[atr_column], errors="coerce")
+    else:
+        high = pd.to_numeric(target_df.get("high"), errors="coerce")
+        low = pd.to_numeric(target_df.get("low"), errors="coerce")
+        prev_close = close.shift(1)
+        true_range = pd.concat(
+            [
+                high - low,
+                (high - prev_close).abs(),
+                (low - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr = true_range.rolling(14, min_periods=14).mean()
+
+    atr = atr.replace(0, np.nan)
+    future_return = (close.shift(-horizon) - close) / atr
+    target_df["target"] = np.tanh(future_return)
+    return target_df
+
        
 def _pearson_binario_simple(df1, df2):
     merged = df1.merge(df2, on="time", how="inner")

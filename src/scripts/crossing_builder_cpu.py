@@ -183,22 +183,25 @@ def selecte_nodes(
     )
     
     
-    df_indicators_os = pd.read_parquet(
-        f'output/{principal_symbol}/crossing/{symbol}/extrac_os/{dire}'
-    )
+     
    
     is_path = f'output/{principal_symbol}/crossing/{symbol}/extrac/{file}'
-    df_indicators_is = pd.read_parquet(is_path)
-   
-    # Convertir time manualmente
-    if "time" in df_indicators_os.columns:
-        df_indicators_os["time"] = pd.to_datetime(df_indicators_os["time"])
-
-    if "time" in df_indicators_is.columns:
-        df_indicators_is["time"] = pd.to_datetime(df_indicators_is["time"])
+    indicators_is = pd.read_parquet(is_path)
+    # Convertir time a datetime ANTES de slice/copy
+    if 'time' in indicators_is.columns and not pd.api.types.is_datetime64_any_dtype(indicators_is['time']):
+        indicators_is['time'] = pd.to_datetime(indicators_is['time'])
+    
+    df_indicators_os = indicators_is.iloc[int(len(indicators_is)*0.8):].copy()  # Para no modificar el original
+    df_indicators_is = indicators_is.iloc[:int(len(indicators_is)*0.8)].copy()  # Para no modificar el original
         
-    df_os = load_csv_cached(f'output/{principal_symbol}/is_os/os.csv')
-    df_is = load_csv_cached(f'output/{principal_symbol}/is_os/is.csv')
+     
+    df_bas = load_csv_cached(f'output/{principal_symbol}/is_os/is.csv')
+    # Convertir time a datetime ANTES de slice/copy
+    if 'time' in df_bas.columns and not pd.api.types.is_datetime64_any_dtype(df_bas['time']):
+        df_bas['time'] = pd.to_datetime(df_bas['time'])
+    
+    df_os = df_bas.iloc[int(len(df_bas)*0.8):].copy()  # Para no modificar el original
+    df_is = df_bas.iloc[:int(len(df_bas)*0.8)].copy()  # Para no modificar el original
     pip_size, point_size = _pip_sizes(df_os['open'], symbol)
     
     os_time_np = df_os['time'].to_numpy()
@@ -219,16 +222,17 @@ def selecte_nodes(
     list_oper_os = list(set(list_oper_os))
     fechas_dt_os = pd.to_datetime(list_oper_os)
     fechas_dt_is = pd.to_datetime(list_oper_is)
- 
-    df_indicators_os_index = df_indicators_os.index[df_indicators_os['time'].isin(fechas_dt_os)]
-    df_indicators_is_index = df_indicators_is.index[df_indicators_is['time'].isin(fechas_dt_is)]
-    
-    df_indicators_os_anteriores = df_indicators_os_index[df_indicators_os_index > 0] - 1
-    df_indicators_is_anteriores = df_indicators_is_index[df_indicators_is_index > 0] - 1
-    
 
-    df_indicators_os_fil = df_indicators_os.iloc[df_indicators_os_anteriores]
-    df_indicators_is_fil = df_indicators_is.iloc[df_indicators_is_anteriores]
+    # Importante: usar posiciones (0..n-1), no labels de índice.
+    # Con labels heredados del DataFrame original, .iloc puede romper con out-of-bounds.
+    os_match_pos = np.flatnonzero(df_indicators_os['time'].isin(fechas_dt_os).to_numpy())
+    is_match_pos = np.flatnonzero(df_indicators_is['time'].isin(fechas_dt_is).to_numpy())
+
+    df_indicators_os_anteriores = os_match_pos[os_match_pos > 0] - 1
+    df_indicators_is_anteriores = is_match_pos[is_match_pos > 0] - 1
+
+    df_indicators_os_fil = df_indicators_os.iloc[df_indicators_os_anteriores].copy()
+    df_indicators_is_fil = df_indicators_is.iloc[df_indicators_is_anteriores].copy()
     
     df_indicators_os_fil = filtro_mercado(df_indicators_os_fil, mercado)
     df_indicators_is_fil = filtro_mercado(df_indicators_is_fil, mercado)
@@ -441,7 +445,8 @@ def selecte_nodes(
 def procesar_archivo(file: str, symbol, action, cont, prev_os, prev_is, porcent_aumento_os, porcent_aumento_is, NumMaxOperations, config, mercado):
     principal_symbol = config['principal_symbol']
     df = pd.read_parquet(f'output/{principal_symbol}/crossing/{symbol}/extrac/{file}')
-    node_generator = NodeGenerator(df)
+    df_generator = df.iloc[:int(len(df)*0.2)].copy()  # Para no modificar el original
+    node_generator = NodeGenerator(df_generator)
     operaciones_exitosas = 0
     while (operaciones_exitosas < NumMaxOperations):
         
@@ -601,10 +606,6 @@ def execute_crossing_builder(principal_symbol, list_mercado):
         general_config = json.load(f)
     with open(f'config/divisas/{principal_symbol}/config_{principal_symbol}.json', 'r', encoding='utf-8') as f:
         config_symbol = json.load(f)
-        
-    for symbol in config_symbol['list_symbol']:
-        for mercado in list_mercado:
-            db_query.eliminar_nodos_y_registros(principal_symbol, symbol, mercado)
             
     config = {
         "general": general_config,

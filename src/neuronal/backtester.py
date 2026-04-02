@@ -8,12 +8,11 @@ import json
 import time
 import ast
 import operator
-import random
-
 
 import pandas as pd
 import numpy as np
 import pyarrow.parquet as pq
+import torch
 
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
@@ -22,7 +21,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")
 
 from src.routes.peticiones import get_historical_data, get_timeframes
 from src.db.query import get_nodes_by_label
-from src.neuronal.data_para_entrenar import data_for_neuronal
 from src.utils.indicadores_for_crossing import extract_indicadores
 from src.utils.common_functions import get_previous_4_6, hora_en_mercado
 from src.neuronal.entrenar import (
@@ -30,16 +28,11 @@ from src.neuronal.entrenar import (
     predict_from_inputs,
     BinaryNN,
     load_data,
-    _serialize_xgb_to_base64
+    save_trained_model,
+    save_ensemble_model,
+    get_embedding_vocab_sizes,
+    validate_embedding_vocab,
 )
-
-
-def _normalize_time_column(df, column_name='time'):
-    if column_name not in df.columns:
-        return df
-    normalized_df = df.copy()
-    normalized_df[column_name] = pd.to_datetime(normalized_df[column_name], errors='coerce')
-    return normalized_df.dropna(subset=[column_name])
 
 
 def _max_decimals(series, sample_size=1000):
@@ -64,6 +57,25 @@ def get_pip_and_point_size(symbol, price_series):
     point_size = (10 ** (-digits)) if digits > 0 else (pip_size / 10)
     return pip_size, point_size
 
+
+def _sanitize_for_json(value):
+    if isinstance(value, dict):
+        return {k: _sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_for_json(v) for v in value]
+    if isinstance(value, tuple):
+        return [_sanitize_for_json(v) for v in value]
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    if isinstance(value, (np.floating, float)):
+        numeric_value = float(value)
+        return numeric_value if np.isfinite(numeric_value) else None
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, np.generic):
+        return _sanitize_for_json(value.item())
+    return value
+
 class Backtester:
 
     def __init__(self, principal_symbol, mercado, algorithm, date_end=None):
@@ -77,32 +89,74 @@ class Backtester:
         self.best_model_data = None
         self.peor_trade = 0.0
         self.info_score = {}
+        self.iteration_candidates = []
+        self.ensemble_model_entries = []
         self.dict_pips_best = {}
-        self.min_trades_score = 40
-        self.trade_reliability_k = 120
+        self.stop_loss = 20
+        self.take_profit = 150
+        self.max_holding = 120
+        self.min_model_holding = 15
+        self.close_confirmation_bars = 2
+        self.close_threshold_floor = 0.60
+        self.close_threshold_ceiling = 0.70
+        self.close_threshold_history = []
+        self.close_threshold_history_window = 5
+        self.threshold_validation_split_ratio = 0.50
+        self.validation_window_months = 6
+        self.train_b_fraction = 0.30
+        self.threshold_min_calibration_trades = 15
+        self.threshold_min_selected_trades = 10
+        self.robust_score_weights = {
+            "expectancy": 2.0,
+            "profit_factor": 1.5,
+            "sharpe": 2.0,
+            "winrate": 1.0,
+            "calmar_ratio": 1.8,
+            "sortino_ratio": 1.5,
+        }
+        self.robust_trade_penalty_center = 25
+        self.robust_trade_penalty_scale = 12
+        self.robust_min_avg_bars = 12
+        self.ensemble_top_k = 3
+        self.ensemble_decay_factor = 0.9
+        self.label_percentile_threshold = 65
+        self.label_min_context_samples = 25
+        self.label_volatility_floor_pips = 5.0
+        self.min_winning_iteration = 8
+        self.max_iterations = 25
+        self.early_stopping_patience = 8
+        self.no_improve_iterations = 0
+        self.min_trades_score = 30
+        self.trade_reliability_k = 40
         self.low_trade_penalty_power = 1.75
+        self.selection_min_trades = 30
+        self.selection_min_profit_factor = 1.15
+        self.selection_min_expectancy = 0.25
+        self.selection_min_winrate = 0.45
+        self.selection_max_drawdown_ratio = 1.50
+        self.selection_max_losing_streak = 7
+        self.selection_min_months = 4
+        self.selection_min_positive_month_ratio = 0.50
+        self.selection_min_positive_quarter_ratio = 0.50
+        self.selection_strong_candidate_min_trades = 20
+        self.selection_strong_candidate_min_profit_factor = 1.35
+        self.selection_strong_candidate_min_expectancy = 4.0
+        self.selection_strong_candidate_min_winrate = 0.40
+        self.selection_strong_candidate_max_drawdown_ratio = 1.75
+        self.selection_strong_candidate_max_losing_streak = 8
+        self.selection_strong_candidate_min_positive_month_ratio = 0.50
+        self.selection_strong_candidate_min_positive_quarter_ratio = 0.50
+        self.selection_strong_candidate_min_deployment_score = 12.0
+        self.selection_strong_candidate_allowed_reasons = {
+            "low_trades",
+            "low_winrate",
+            "low_positive_month_ratio",
+        }
+        self.train_b_label_blocks = 3
         self.data_end = date_end
         self.principal_symbol = principal_symbol
         self.mercado = mercado
         self.algorithm = algorithm
-        self.n_iterations = 25 if not self.data_end else 10   
-        self.use_wfo = True
-        self.wfo_train_years = 4
-        self.wfo_test_years = 1
-        self.wfo_step_years = 1
-        # Umbral legado (compatibilidad para métricas/JSON); ya no gobierna cierres en regresión
-        self.min_close_prob = 0.05
-        # Cierre inteligente por edge (regresión)
-        self.edge_threshold = 0.01
-        self.edge_decay_factor = 0.6
-        self.edge_delta_threshold = -0.05
-        self.min_open_edge = -0.05
-        self.max_loss_close_pips = -15
-        self.hard_stop_pips = -25
-        self.future_horizon_bars = 5
-        self.stop_loss_pips = -50
-        self.take_profit_pips = 120
-        self.max_trade_duration = 150
         
         if self.algorithm == "UP":
             self.other_algorithm = "DOWN"
@@ -117,7 +171,7 @@ class Backtester:
         self.prepare_base_data()
         self.pip_size, self.point_size = get_pip_and_point_size(
             self.principal_symbol,
-            self.df_train['open'] if 'open' in self.df_train.columns else self.df_valid['open']
+            self.df_train_A['open'] if 'open' in self.df_train_A.columns else self.df_valid['open']
         )
 
         self.setup_operators_and_mappings()
@@ -144,158 +198,158 @@ class Backtester:
         )
         self.data_start_is = data_start_is
         self.data_end_is = data_end_is
-
-        self.n_iterations = int(general_config.get('backtester_iterations', self.n_iterations))
-        self.use_wfo = bool(general_config.get('backtester_use_wfo', self.use_wfo))
-        self.wfo_train_years = int(general_config.get('backtester_wfo_train_years', self.wfo_train_years))
-        self.wfo_test_years = int(general_config.get('backtester_wfo_test_years', self.wfo_test_years))
-        self.wfo_step_years = int(general_config.get('backtester_wfo_step_years', self.wfo_step_years))
-
-        # Parámetros de edge/riesgo configurables por JSON para ajustar frecuencia sin tocar código
-        self.min_open_edge = float(general_config.get('min_open_edge', self.min_open_edge))
-        self.edge_threshold = float(general_config.get('edge_threshold', self.edge_threshold))
-        self.edge_decay_factor = float(general_config.get('edge_decay_factor', self.edge_decay_factor))
-        self.edge_delta_threshold = float(general_config.get('edge_delta_threshold', self.edge_delta_threshold))
-        self.max_loss_close_pips = float(general_config.get('max_loss_close_pips', self.max_loss_close_pips))
-        self.hard_stop_pips = float(general_config.get('hard_stop_pips', self.hard_stop_pips))
-        
         
     def prepare_base_data(self):
-        
-        df_is = pd.read_csv(f'output/{self.principal_symbol}/is_os/is.csv')
-        df_os = pd.read_csv(f'output/{self.principal_symbol}/is_os/os.csv')
-        df_is = _normalize_time_column(df_is)
-        df_os = _normalize_time_column(df_os)
-        
-        if self.data_end :
-            timeframes = get_timeframes()
-            date_start = pd.to_datetime(df_os['time'].iloc[-1]).strftime('%Y-%m-%d')
-            timeframe = timeframes.get(self.general_config['timeframe'])      
-            rates = get_historical_data(self.principal_symbol, timeframe, date_start, self.data_end)
-            new_df = pd.DataFrame(rates)
-            new_df['time'] = pd.to_datetime(new_df['time'], unit='s', errors='coerce')
-            new_df = new_df.dropna(subset=['time'])
-            extract_indicadores(self.principal_symbol, new_df)
-            df_os = pd.concat([df_os, new_df], ignore_index=True).drop_duplicates(subset='time').sort_values('time').reset_index(drop=True)
 
-        df_base1 = (
-            pd.concat([df_is, df_os], ignore_index=True)
-            .drop_duplicates(subset='time')
+        if self.data_end is None:
+            df_is = pd.read_csv(f'output/{self.principal_symbol}/is_os/is.csv')
+            df_os = pd.read_csv(f'output/{self.principal_symbol}/is_os/os.csv')
+
+            df_base1 = (
+                pd.concat([df_is, df_os], ignore_index=True)
+                .drop_duplicates(subset='time')
+            )
+
+            df_base1['time'] = pd.to_datetime(df_base1['time'])
+
+            df_base = df_base1[
+                df_base1['time'] >= datetime.strptime(
+                    self.data_start_is, '%Y-%m-%d'
+                )
+            ]
+        else:
+            timeframes = get_timeframes()
+            fecha_str = self.data_end
+            fecha_dt = datetime.strptime(fecha_str, "%Y-%m-%d")
+
+            # Restar 6 años
+            fecha_6_atras = fecha_dt - relativedelta(years=3)
+
+            # Volver a formato string
+            fecha_6_atras_str = fecha_6_atras.strftime("%Y-%m-%d")
+            timeframe = timeframes.get(self.general_config['timeframe']) 
+            rates = get_historical_data(self.principal_symbol, timeframe, fecha_6_atras_str, self.data_end)
+            df_base = pd.DataFrame(rates)
+            df_base['time'] = pd.to_datetime(df_base['time'], unit='s')
+            df_base_for_indicators = df_base.copy()
+            list_files_ = os.listdir(f'output/{self.principal_symbol}/extrac_os')
+            indicadores_m =pd.read_parquet(f'output/{self.principal_symbol}/extrac_os/{list_files_[0]}', columns=['time'])
+            time_ultimo_indicador = indicadores_m['time'].iloc[-1]
+            index_coincidencia = df_base_for_indicators[df_base_for_indicators['time'] == time_ultimo_indicador].index[0]
+            if index_coincidencia >= 830:
+                df_base_for_indicators = df_base_for_indicators.iloc[index_coincidencia-830:]
+            print(len(df_base_for_indicators))
+            if len(df_base_for_indicators) - 830 > 20:
+                extract_indicadores(self.principal_symbol, df_base_for_indicators)
+            
+            
+        df_base = df_base.sort_values('time').set_index('time')
+        df_base = self.add_market_features(df_base)
+        self.split_temporal_windows(df_base)
+
+
+    def split_temporal_windows(self, df_base):
+        if df_base.empty:
+            self.df_train_A = df_base
+            self.df_train_B = df_base
+            self.df_valid = df_base
+            return
+
+        validation_end = df_base.index.max()
+        validation_start = validation_end - relativedelta(months=self.validation_window_months)
+        df_valid = df_base[df_base.index >= validation_start]
+        df_pre_validation = df_base[df_base.index < validation_start]
+
+        if df_valid.empty:
+            fallback_cut = max(1, int(len(df_base) * 0.15))
+            df_valid = df_base.iloc[-fallback_cut:]
+            df_pre_validation = df_base.iloc[:-fallback_cut]
+
+        if df_pre_validation.empty:
+            split_idx = max(1, len(df_base) - len(df_valid))
+            self.df_train_A = df_base.iloc[:split_idx]
+            self.df_train_B = df_base.iloc[:0].copy()
+            self.df_valid = df_valid
+            return
+
+        train_b_size = int(len(df_pre_validation) * self.train_b_fraction)
+        train_b_size = max(1, train_b_size)
+        train_b_size = min(train_b_size, len(df_pre_validation))
+        split_idx = len(df_pre_validation) - train_b_size
+
+        if split_idx <= 0:
+            split_idx = max(1, len(df_pre_validation) - 1)
+
+        self.df_train_A = df_pre_validation.iloc[:split_idx]
+        self.df_train_B = df_pre_validation.iloc[split_idx:]
+        self.df_valid = df_valid
+
+        print(
+            "Ventanas temporales preparadas | "
+            f"train_A: {self.df_train_A.index.min()} -> {self.df_train_A.index.max()} ({len(self.df_train_A)}) | "
+            f"train_B: {self.df_train_B.index.min() if not self.df_train_B.empty else 'empty'} -> "
+            f"{self.df_train_B.index.max() if not self.df_train_B.empty else 'empty'} ({len(self.df_train_B)}) | "
+            f"valid: {self.df_valid.index.min()} -> {self.df_valid.index.max()} ({len(self.df_valid)})"
         )
 
-        df_base = df_base1[
-            df_base1['time'] >= datetime.strptime(
-                self.data_start_is, '%Y-%m-%d'
-            )
-        ]  
-        self.df_base = df_base.sort_values('time').set_index('time')
-        corte = int(0.8 * len(self.df_base))
-        self.df_train = self.df_base.iloc[:corte]
-        self.df_valid = self.df_base.iloc[corte:]   
+
+    def add_market_features(self, df):
+        df = df.copy()
+        df['ret_1'] = df['close'] - df['open']
+        df['ret_3'] = df['close'] - df['close'].shift(3)
+        df['ret_10'] = df['close'] - df['close'].shift(10)
+        df['range_1'] = df['high'] - df['low']
+        df['ma_5'] = df['close'].rolling(5).mean()
+        df['ma_10'] = df['close'].rolling(10).mean()
+        df['ma_20'] = df['close'].rolling(20).mean()
+        df['trend'] = df['close'] - df['ma_5']
+        df['trend_10'] = df['close'] - df['ma_10']
+        df['trend_20'] = df['close'] - df['ma_20']
+        df['vol'] = df['close'].rolling(5).std()
+        df['vol_10'] = df['close'].rolling(10).std()
+        df['vol_20'] = df['close'].rolling(20).std()
+        df['zscore_20'] = (df['close'] - df['ma_20']) / (df['vol_20'] + 1e-8)
+        df['momentum_ratio'] = df['ret_3'] / (df['vol_10'] + 1e-8)
+        return df.dropna()
 
 
-    def _reset_iteration_state(self):
-        self.index = 0
-        self.best_score = float('-inf')
-        self.best_model_data = None
-        self.peor_trade = 0.0
-        self.info_score = {}
-        self.dict_pips_best = {}
+    def get_market_features(self, row):
+        if isinstance(row, pd.Series):
+            return np.array([
+                float(row['ret_1']),
+                float(row['range_1']),
+                float(row['trend']),
+                float(row['vol']),
+                float(row['ret_3']),
+                float(row['ret_10']),
+                float(row['trend_10']),
+                float(row['trend_20']),
+                float(row['vol_10']),
+                float(row['vol_20']),
+                float(row['zscore_20']),
+                float(row['momentum_ratio']),
+            ], dtype=np.float32)
+
+        return np.array([
+            float(getattr(row, 'ret_1')),
+            float(getattr(row, 'range_1')),
+            float(getattr(row, 'trend')),
+            float(getattr(row, 'vol')),
+            float(getattr(row, 'ret_3')),
+            float(getattr(row, 'ret_10')),
+            float(getattr(row, 'trend_10')),
+            float(getattr(row, 'trend_20')),
+            float(getattr(row, 'vol_10')),
+            float(getattr(row, 'vol_20')),
+            float(getattr(row, 'zscore_20')),
+            float(getattr(row, 'momentum_ratio')),
+        ], dtype=np.float32)
 
 
-    def _run_training_loop(self):
-        last_model_data = None
-
-        for i in range(self.n_iterations):
-            random.shuffle(self.nodos_close)
-            print(f"\n--- Iteración {i+1}/{self.n_iterations} ---")
-            self.index = i + 1
-            model_data = self.train_iteration()
-            last_model_data = model_data
-            metrics = self.validate_iteration()
-            self.calculate_score(metrics, model_data)
-
-        if self.best_model_data is None:
-            self.best_model_data = last_model_data
-
-        return {
-            "best_model_data": self.best_model_data,
-            "best_score": self.best_score,
-            "info_score": self.info_score,
-            "last_model_data": last_model_data
-        }
-
-
-    def generate_wfo_windows(self):
-        windows = []
-        if self.df_base.empty:
-            return windows
-
-        idx_min = self.df_base.index.min()
-        idx_max = self.df_base.index.max()
-        current_test_end = idx_max
-
-        while True:
-            test_start = current_test_end - relativedelta(years=self.wfo_test_years)
-            train_end = test_start
-            train_start = train_end - relativedelta(years=self.wfo_train_years)
-
-            if train_start < idx_min:
-                break
-
-            df_train = self.df_base[(self.df_base.index >= train_start) & (self.df_base.index < train_end)]
-            df_valid = self.df_base[(self.df_base.index >= test_start) & (self.df_base.index <= current_test_end)]
-
-            if len(df_train) > 0 and len(df_valid) > 0:
-                windows.append({
-                    "train_start": train_start,
-                    "train_end": train_end,
-                    "test_start": test_start,
-                    "test_end": current_test_end,
-                    "df_train": df_train,
-                    "df_valid": df_valid,
-                })
-
-            current_test_end = current_test_end - relativedelta(years=self.wfo_step_years)
-            if current_test_end <= idx_min:
-                break
-
-        return windows
-
-
-    def _max_drawdown_from_pips(self, lista_pips):
-        if not lista_pips:
-            return 0.0
-
-        equity = np.cumsum(lista_pips)
-        peak = np.maximum.accumulate(equity)
-        drawdowns = peak - equity
-        return float(np.max(drawdowns)) if len(drawdowns) else 0.0
-
-
-    def _compact_metrics(self, metrics):
-        if not metrics:
-            return {}
-
-        lista_pips = metrics.get("lista_pips", [])
-        return {
-            "iteracion": metrics.get("iteracion", 0),
-            "score": float(metrics.get("score", 0.0)),
-            "score_base": float(metrics.get("score_base", 0.0)),
-            "winrate": float(metrics.get("winrate", 0.0)),
-            "profit_factor": float(metrics.get("profit_factor", 0.0)),
-            "expectancy": float(metrics.get("expectancy", 0.0)),
-            "sharpe": float(metrics.get("sharpe", 0.0)),
-            "min_close_prob": float(self.min_close_prob),
-            "cantidad_operaciones": int(metrics.get("cantidad_operaciones", 0)),
-            "sum_pips": float(metrics.get("sum_pips", 0.0)),
-            "mas_perdidas_seguidas": int(metrics.get("mas_perdidas_seguidas", 0)),
-            "peor_trade": float(metrics.get("peor_trade", 0.0)),
-            "max_drawdown": self._max_drawdown_from_pips(lista_pips),
-            "volumen_factor": float(metrics.get("volumen_factor", 0.0)),
-            "reliability_factor": float(metrics.get("reliability_factor", 0.0)),
-            "low_trade_penalty": float(metrics.get("low_trade_penalty", 0.0)),
-        }
+    def get_trade_risk_limits(self, row):
+        adaptive_stop = max(self.stop_loss, 1.5 * float(getattr(row, 'vol_10', 0.0)) / self.pip_size)
+        adaptive_take = max(self.take_profit, 2.0 * float(getattr(row, 'vol_10', 0.0)) / self.pip_size)
+        return adaptive_stop, adaptive_take
     
   
     def actualizar_dict(self, principal, nuevo_dict):
@@ -306,7 +360,7 @@ class Backtester:
             else:
                 # Promedio ponderado (como en TradingEngine.record_trade)
                 principal[k] = (
-                    principal[k] * 0.8 + v * 0.2
+                    principal[k] + v 
                 )
         
         return principal 
@@ -414,7 +468,7 @@ class Backtester:
       
     
     def build_combined(self, path_is, path_os):
-       
+
         df_is = self.load_df(path_is)
         df_os = self.load_df(path_os)
 
@@ -440,209 +494,560 @@ class Backtester:
         return movement_pips - spread_pips
 
 
-    def calculate_trade_pips_with_sl_tp(self, open_price_open, bar_high, bar_low, bar_close, spread_open):
-        """
-        Ejecuta SL/TP de forma realista usando HIGH/LOW intrabar.
-        Si ambos se tocan en la misma vela, usa resolución conservadora (SL primero).
-        """
-        sl_abs = abs(float(self.stop_loss_pips))
-        tp_abs = abs(float(self.take_profit_pips))
-        spread_pips = spread_open * self.point_size / self.pip_size
+    def simulate_training_trade(
+        self,
+        df,
+        entry_idx,
+        entry_red_opens,
+        open_price_open,
+        spread_open,
+        current_stop_loss,
+        current_take_profit,
+        dict_pips,
+        list_keys,
+    ):
+        last_idx = entry_idx
 
-        if self.algorithm == 'UP':
-            sl_price = open_price_open - (sl_abs * self.pip_size)
-            tp_price = open_price_open + (tp_abs * self.pip_size)
+        for offset in range(1, self.max_holding + 1):
+            current_idx = entry_idx + offset
+            if current_idx >= len(df):
+                break
 
-            sl_hit = bar_low <= sl_price
-            tp_hit = bar_high >= tp_price
-
-            if sl_hit and tp_hit:
-                return float(-sl_abs - spread_pips), "SL"
-            if sl_hit:
-                return float(-sl_abs - spread_pips), "SL"
-            if tp_hit:
-                return float(tp_abs - spread_pips), "TP"
-
-            movement_pips = (bar_close - open_price_open) / self.pip_size
-            return float(movement_pips - spread_pips), None
-
-        # DOWN
-        sl_price = open_price_open + (sl_abs * self.pip_size)
-        tp_price = open_price_open - (tp_abs * self.pip_size)
-
-        sl_hit = bar_high >= sl_price
-        tp_hit = bar_low <= tp_price
-
-        if sl_hit and tp_hit:
-            return float(-sl_abs - spread_pips), "SL"
-        if sl_hit:
-            return float(-sl_abs - spread_pips), "SL"
-        if tp_hit:
-            return float(tp_abs - spread_pips), "TP"
-
-        movement_pips = (open_price_open - bar_close) / self.pip_size
-        return float(movement_pips - spread_pips), None
-
-
-    def compute_future_target(self, df_prices, time_actual, current_price, horizon=5):
-        """
-        Target predictivo profesional: MFE - |MAE| sobre N velas futuras.
-        Retorna (target, mfe, mae) en pips.
-        """
-        if df_prices is None or df_prices.empty:
-            return 0.0, 0.0, 0.0
-
-        if time_actual not in df_prices.index:
-            return 0.0, 0.0, 0.0
-
-        pos = int(df_prices.index.get_loc(time_actual))
-        future = df_prices.iloc[pos + 1: pos + 1 + int(horizon)]
-        if future.empty:
-            return 0.0, 0.0, 0.0
-
-        if 'high' not in future.columns or 'low' not in future.columns:
-            return 0.0, 0.0, 0.0
-
-        highs = future['high'].astype(float).values
-        lows = future['low'].astype(float).values
-        if len(highs) == 0 or len(lows) == 0:
-            return 0.0, 0.0, 0.0
-
-        cp = float(current_price)
-        if self.algorithm == 'UP':
-            mfe = float((np.max(highs) - cp) / self.pip_size)
-            mae = float((np.min(lows) - cp) / self.pip_size)
-        else:
-            mfe = float((cp - np.min(lows)) / self.pip_size)
-            mae = float((cp - np.max(highs)) / self.pip_size)
-
-        target = float(mfe - abs(mae))
-        return target, mfe, mae
-
-
-    def compute_best_open_edge(self, nn, entry_open_signal, time_actual_np, time_actual, spread_open, market_ctx_open):
-        """
-        Estima el edge de apertura evaluando los nodos de cierre disponibles en el timestamp actual
-        y devolviendo la mejor predicción cruda.
-        """
-        open_candidates = []
-
-        for nodo in self.nodos_close:
-            df_struct = self.COMBINED[("close", nodo["file"])]
-            pos = df_struct["index_values"].searchsorted(time_actual_np)
-            if pos == 0:
-                continue
-
-            if not self.cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
-                continue
-
-            nodo_close = self.maping_close[nodo["key"]]
-            market_ctx = self._get_market_context(df_struct, pos - 1, time_actual, spread_open)
-
-            _, prob, pred = predict_from_inputs(
-                nn,
-                entry_open_signal,
-                nodo_close,
-                atr=market_ctx["atr"],
-                adx=market_ctx["adx"],
-                rsi=market_ctx["rsi"],
-                hour=market_ctx["hour"],
-                spread=market_ctx["spread"],
-                stoch=market_ctx["stoch"],
-                atr_open=market_ctx_open.get("atr", 0.0),
-                adx_open=market_ctx_open.get("adx", 0.0),
-                rsi_open=market_ctx_open.get("rsi", 0.0),
-                stoch_open=market_ctx_open.get("stoch", 50.0),
-                returns_1=market_ctx.get("returns_1", 0.0),
-                volatility=market_ctx.get("volatility", 0.0),
-                trend=market_ctx.get("trend", 0.0),
-                return_raw=True,
+            current_row = df.iloc[current_idx]
+            current_time = df.index[current_idx]
+            current_time_np = np.datetime64(current_time)
+            current_hour = format(current_time.hour, "05b")
+            current_pips = self.calculate_trade_pips(
+                open_price_open,
+                current_row.open,
+                spread_open,
             )
+            last_idx = current_idx
 
-            open_candidates.append((nodo_close, float(prob), float(pred)))
+            matching_close_nodes = []
+            if offset >= self.min_model_holding:
+                for nodo in self.nodos_close:
+                    df_struct = self.COMBINED[("close", nodo["file"])]
+                    pos = df_struct["index_values"].searchsorted(current_time_np)
+                    if pos == 0:
+                        continue
 
-        if not open_candidates:
-            return None, None, None
+                    if self.cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
+                        matching_close_nodes.append(self.maping_close[nodo["key"]])
 
-        best_nodo, best_prob, best_pred = max(open_candidates, key=lambda x: x[2])
-        return best_nodo, best_prob, best_pred
+            if matching_close_nodes:
+                for entry_red_open in entry_red_opens:
+                    for nodo_close_selected in matching_close_nodes:
+                        key_pru = f'{entry_red_open}_{nodo_close_selected}_{current_hour}_{current_time}'
+                        if key_pru in list_keys:
+                            continue
+                        list_keys.add(key_pru)
+
+                        key = f'{entry_red_open}_{nodo_close_selected}_{current_hour}'
+                        if key not in dict_pips:
+                            dict_pips[key] = [current_pips]
+                        else:
+                            dict_pips[key].append(current_pips)
+
+            if (
+                current_pips <= -current_stop_loss or
+                current_pips >= current_take_profit or
+                offset >= self.max_holding
+            ):
+                break
+
+        return last_idx
 
 
-    def _get_value_from_struct(self, df_struct, row_idx, aliases, default=0.0):
-        col_map = df_struct["col_map"]
-        row = df_struct["values"][row_idx]
+    def collect_training_pips_map(self, df):
+        list_keys = set()
+        dict_pips = {}
+        row_pos = 0
+        total_rows = len(df)
 
-        for alias in aliases:
-            if alias in col_map:
-                v = row[col_map[alias]]
-                if v is None or pd.isna(v):
-                    continue
-                try:
-                    return float(v)
-                except Exception:
-                    continue
-        return float(default)
+        while row_pos < total_rows:
+            row = df.iloc[row_pos]
+            entry_red_opens = []
+            time_actual = df.index[row_pos]
+            time_actual_np = np.datetime64(time_actual)
 
+            if not self.horas_mercado[time_actual.hour]:
+                row_pos += 1
+                continue
 
-    def _get_market_context(self, df_struct, row_idx, time_actual, spread_open):
-        atr = self._get_value_from_struct(
-            df_struct,
-            row_idx,
-            ["ATR_23", "ATR23", "ATR", "atr_23", "atr"],
-            default=0.0
-        )
-        adx = self._get_value_from_struct(
-            df_struct,
-            row_idx,
-            ["ADX_20", "ADX20", "ADX", "adx_20", "adx"],
-            default=0.0
-        )
-        rsi = self._get_value_from_struct(
-            df_struct,
-            row_idx,
-            ["RSI_21", "RSI21", "RSI", "rsi_21", "rsi"],
-            default=0.0
-        )
-        stoch = self._get_value_from_struct(
-            df_struct,
-            row_idx,
-            ["STOCH_14_3_SMA_3_SMA_pos0", "STOCH_14_3_3", "STOCH", "stoch"],
-            default=50.0
-        )
+            open_price = row.open
 
-        # Cambio 3: Añadir features crudas de mercado
-        # Calcular returns (corto plazo)
-        close_curr = self._get_value_from_struct(df_struct, row_idx, ["close", "Close"], default=0.0)
-        open_curr = self._get_value_from_struct(df_struct, row_idx, ["open", "Open"], default=0.0)
-        high_curr = self._get_value_from_struct(df_struct, row_idx, ["high", "High"], default=0.0)
-        low_curr = self._get_value_from_struct(df_struct, row_idx, ["low", "Low"], default=0.0)
-        
-        # Returns intraday (normalizado)
-        returns_1 = (close_curr - open_curr) / max(abs(open_curr), 0.0001) if open_curr != 0 else 0.0
-        
-        # Volatility intraday (high-low range normalizado)
-        volatility = (high_curr - low_curr) / max(abs(close_curr), 0.0001) if close_curr != 0 else 0.0
-        
-        # Trend simple: si close > open, uptrend (+1), else downtrend (-1)
-        trend = 1.0 if close_curr > open_curr else -1.0
+            for symbol in self.list_symbols:
+                cumple_alguno = False
+                nodo_open_list = self.dict_nodos[symbol]
+
+                for nodo in nodo_open_list:
+                    df_struct = self.COMBINED[("open", symbol, nodo["file"])]
+                    pos = df_struct["index_values"].searchsorted(time_actual_np)
+                    if pos == 0:
+                        continue
+
+                    if self.cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
+                        cumple_alguno = True
+
+                        if symbol == self.list_symbols[-1]:
+                            nodo_open = self.maping_open[nodo["key"]]
+                            entry_red_opens.append(nodo_open)
+                        else:
+                            break
+
+                if not cumple_alguno:
+                    break
+
+            if not entry_red_opens:
+                row_pos += 1
+                continue
+
+            spread_open = getattr(row, 'spread', 0.0)
+            current_stop_loss, current_take_profit = self.get_trade_risk_limits(row)
+            exit_idx = self.simulate_training_trade(
+                df=df,
+                entry_idx=row_pos,
+                entry_red_opens=entry_red_opens,
+                open_price_open=open_price,
+                spread_open=spread_open,
+                current_stop_loss=current_stop_loss,
+                current_take_profit=current_take_profit,
+                dict_pips=dict_pips,
+                list_keys=list_keys,
+            )
+            row_pos = max(exit_idx + 1, row_pos + 1)
 
         return {
-            "atr": atr,
-            "adx": adx,
-            "rsi": rsi,
-            "stoch": stoch,
-            "hour": float(time_actual.hour),
-            "spread": float(spread_open),
-            # Nuevas features de mercado
-            "returns_1": float(returns_1),
-            "volatility": float(volatility),
-            "trend": float(trend),
+            key: float(np.mean(values))
+            for key, values in dict_pips.items()
+            if values
+        }
+
+
+    def build_walk_forward_dataset(self, df_target, dict_pips_seed):
+        if df_target.empty:
+            return self.build_dataset_from_df(df_target, dict_pips_seed)
+
+        block_count = max(1, min(self.train_b_label_blocks, len(df_target)))
+        split_points = np.linspace(0, len(df_target), block_count + 1, dtype=int)
+        rolling_dict = dict(dict_pips_seed)
+        dataset_parts = []
+
+        for block_idx in range(block_count):
+            start_idx = split_points[block_idx]
+            end_idx = split_points[block_idx + 1]
+            if end_idx <= start_idx:
+                continue
+
+            df_block = df_target.iloc[start_idx:end_idx]
+            block_dataset = self.build_dataset_from_df(df_block, rolling_dict, allow_empty=True)
+            if not block_dataset.empty:
+                dataset_parts.append(block_dataset)
+
+            block_pips_map = self.collect_training_pips_map(df_block)
+            if block_pips_map:
+                rolling_dict = self.actualizar_dict(rolling_dict, block_pips_map)
+
+        if not dataset_parts:
+            return self.build_dataset_from_df(df_target, dict_pips_seed)
+
+        return pd.concat(dataset_parts, ignore_index=True)
+
+
+    def build_selection_reference(self, metrics):
+        raw_reasons = []
+        if metrics["cantidad_operaciones"] < self.selection_min_trades:
+            raw_reasons.append("low_trades")
+        if metrics["profit_factor"] < self.selection_min_profit_factor:
+            raw_reasons.append("low_profit_factor")
+        if metrics["expectancy"] < self.selection_min_expectancy:
+            raw_reasons.append("low_expectancy")
+        if metrics["winrate"] < self.selection_min_winrate:
+            raw_reasons.append("low_winrate")
+        if metrics["max_drawdown_ratio"] > self.selection_max_drawdown_ratio:
+            raw_reasons.append("high_drawdown_ratio")
+        if metrics["mas_perdidas_seguidas"] > self.selection_max_losing_streak:
+            raw_reasons.append("high_losing_streak")
+        if metrics["temporal_stats"]["n_months"] < self.selection_min_months:
+            raw_reasons.append("low_month_coverage")
+        if metrics["temporal_stats"]["positive_month_ratio"] < self.selection_min_positive_month_ratio:
+            raw_reasons.append("low_positive_month_ratio")
+        if metrics["temporal_stats"]["positive_quarter_ratio"] < self.selection_min_positive_quarter_ratio:
+            raw_reasons.append("low_positive_quarter_ratio")
+
+        deployment_score = (
+            (metrics["profit_factor"] * 2.0) +
+            (metrics["expectancy"] * 1.5) +
+            (metrics["winrate"] * 100.0 * 0.03) +
+            (metrics["sharpe"] * 1.5) -
+            (metrics["max_drawdown_ratio"] * 2.0) +
+            (metrics["temporal_stats"]["positive_month_ratio"] * 3.0) +
+            (metrics["temporal_stats"]["positive_quarter_ratio"] * 2.0)
+        )
+        if not np.isfinite(deployment_score):
+            deployment_score = -9999.0
+
+        return {
+            "raw_reasons": raw_reasons,
+            "deployment_score": float(deployment_score),
+            "thresholds": {
+                "min_trades": self.selection_min_trades,
+                "min_profit_factor": self.selection_min_profit_factor,
+                "min_expectancy": self.selection_min_expectancy,
+                "min_winrate": self.selection_min_winrate,
+                "max_drawdown_ratio": self.selection_max_drawdown_ratio,
+                "max_losing_streak": self.selection_max_losing_streak,
+                "min_months": self.selection_min_months,
+                "min_positive_month_ratio": self.selection_min_positive_month_ratio,
+                "min_positive_quarter_ratio": self.selection_min_positive_quarter_ratio,
+                "strong_candidate": {
+                    "min_trades": self.selection_strong_candidate_min_trades,
+                    "min_profit_factor": self.selection_strong_candidate_min_profit_factor,
+                    "min_expectancy": self.selection_strong_candidate_min_expectancy,
+                    "min_winrate": self.selection_strong_candidate_min_winrate,
+                    "max_drawdown_ratio": self.selection_strong_candidate_max_drawdown_ratio,
+                    "max_losing_streak": self.selection_strong_candidate_max_losing_streak,
+                    "min_positive_month_ratio": self.selection_strong_candidate_min_positive_month_ratio,
+                    "min_positive_quarter_ratio": self.selection_strong_candidate_min_positive_quarter_ratio,
+                    "min_deployment_score": self.selection_strong_candidate_min_deployment_score,
+                    "allowed_reasons": sorted(self.selection_strong_candidate_allowed_reasons),
+                },
+            },
+        }
+
+
+    def summarize_temporal_performance(self, lista_pips):
+        monthly_pips = {}
+        quarterly_pips = {}
+
+        for item in lista_pips:
+            time_close = item.get("time_close")
+            if not time_close:
+                continue
+            close_ts = pd.to_datetime(time_close)
+            month_key = close_ts.strftime("%Y-%m")
+            quarter_key = f"{close_ts.year}-Q{((close_ts.month - 1) // 3) + 1}"
+            monthly_pips[month_key] = monthly_pips.get(month_key, 0.0) + float(item["pips"])
+            quarterly_pips[quarter_key] = quarterly_pips.get(quarter_key, 0.0) + float(item["pips"])
+
+        month_values = list(monthly_pips.values())
+        quarter_values = list(quarterly_pips.values())
+
+        positive_month_ratio = (
+            float(sum(1 for value in month_values if value > 0) / len(month_values))
+            if month_values else 0.0
+        )
+        positive_quarter_ratio = (
+            float(sum(1 for value in quarter_values if value > 0) / len(quarter_values))
+            if quarter_values else 0.0
+        )
+
+        return {
+            "n_months": len(month_values),
+            "n_quarters": len(quarter_values),
+            "positive_month_ratio": positive_month_ratio,
+            "positive_quarter_ratio": positive_quarter_ratio,
+            "best_month_pips": float(max(month_values)) if month_values else 0.0,
+            "worst_month_pips": float(min(month_values)) if month_values else 0.0,
+            "best_quarter_pips": float(max(quarter_values)) if quarter_values else 0.0,
+            "worst_quarter_pips": float(min(quarter_values)) if quarter_values else 0.0,
+            "monthly_pips": monthly_pips,
+            "quarterly_pips": quarterly_pips,
+        }
+
+
+    def get_validation_window_df(self):
+        return self.df_valid
+
+
+    def build_dataset_from_df(self, df, dict_pips_best, allow_empty=False):
+
+        candidate_samples = []
+
+        for row in df.itertuples():
+            time_actual = row.Index
+            time_actual_np = np.datetime64(time_actual)
+            hour = format(time_actual.hour, "05b")
+            open_nodes = []
+
+            for symbol in self.list_symbols:
+                cumple_alguno = False
+                nodo_open_list = self.dict_nodos[symbol]
+
+                for nodo in nodo_open_list:
+                    df_struct = self.COMBINED[("open", symbol, nodo["file"])]
+                    pos = df_struct["index_values"].searchsorted(time_actual_np)
+
+                    if pos == 0:
+                        continue
+
+                    if self.cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
+                        cumple_alguno = True
+
+                        if symbol == self.list_symbols[-1]:
+                            nodo_open = self.maping_open[nodo["key"]]
+                            open_nodes.append(nodo_open)
+                        else:
+                            break
+
+                if not cumple_alguno:
+                    open_nodes = []
+                    break
+
+            if not open_nodes:
+                continue
+
+            valid_closes = []
+            for nodo_c in self.nodos_close:
+                df_struct_c = self.COMBINED[("close", nodo_c["file"])]
+                pos_c = df_struct_c["index_values"].searchsorted(time_actual_np)
+
+                if pos_c == 0:
+                    continue
+
+                if self.cumple_condiciones_fast(df_struct_c, pos_c - 1, nodo_c["conditions"]):
+                    nodo_close = self.maping_close[nodo_c["key"]]
+                    valid_closes.append(nodo_close)
+
+            if not valid_closes:
+                continue
+
+            raw_volatility_pips = max(
+                abs(float(getattr(row, 'vol_10', 0.0))) / self.pip_size,
+                abs(float(getattr(row, 'vol_20', 0.0))) / self.pip_size,
+            )
+            volatility_pips = max(raw_volatility_pips, self.label_volatility_floor_pips)
+
+            for nodo_open in open_nodes:
+                for nodo_close in valid_closes:
+                    key = f"{nodo_open}_{nodo_close}_{hour}"
+
+                    if key not in dict_pips_best:
+                        continue
+
+                    expected_pips = float(dict_pips_best[key])
+                    normalized_pips = float(expected_pips / volatility_pips)
+                    candidate_samples.append({
+                        "input1": nodo_open,
+                        "input2": nodo_close,
+                        "hour": hour,
+                        "ret_1": float(row.ret_1),
+                        "range_1": float(row.range_1),
+                        "trend": float(row.trend),
+                        "vol": float(row.vol),
+                        "ret_3": float(row.ret_3),
+                        "ret_10": float(row.ret_10),
+                        "trend_10": float(row.trend_10),
+                        "trend_20": float(row.trend_20),
+                        "vol_10": float(row.vol_10),
+                        "vol_20": float(row.vol_20),
+                        "zscore_20": float(row.zscore_20),
+                        "momentum_ratio": float(row.momentum_ratio),
+                        "expected_pips": expected_pips,
+                        "normalized_pips": normalized_pips,
+                    })
+
+        context_values = {}
+        global_values = []
+        for sample in candidate_samples:
+            context_values.setdefault(sample["hour"], []).append(sample["normalized_pips"])
+            global_values.append(sample["normalized_pips"])
+
+        def get_thresholds(hour_key):
+            values = context_values.get(hour_key, [])
+            if len(values) < self.label_min_context_samples:
+                values = global_values
+
+            if len(values) < self.label_min_context_samples:
+                return 0.0, 0.0
+
+            upper = float(np.percentile(values, self.label_percentile_threshold))
+            lower = float(np.percentile(values, 100 - self.label_percentile_threshold))
+            return upper, lower
+
+        data = {
+            'input1': [],
+            'input2': [],
+            'hour': [],
+            'ret_1': [],
+            'range_1': [],
+            'trend': [],
+            'vol': [],
+            'ret_3': [],
+            'ret_10': [],
+            'trend_10': [],
+            'trend_20': [],
+            'vol_10': [],
+            'vol_20': [],
+            'zscore_20': [],
+            'momentum_ratio': [],
+            'output': []
+        }
+
+        for sample in candidate_samples:
+            upper_threshold, lower_threshold = get_thresholds(sample["hour"])
+            normalized_pips = sample["normalized_pips"]
+
+            if normalized_pips >= upper_threshold:
+                label = 1.0
+            elif normalized_pips <= lower_threshold:
+                label = 0.0
+            else:
+                continue
+
+            data['input1'].append(sample['input1'])
+            data['input2'].append(sample['input2'])
+            data['hour'].append(sample['hour'])
+            data['ret_1'].append(sample['ret_1'])
+            data['range_1'].append(sample['range_1'])
+            data['trend'].append(sample['trend'])
+            data['vol'].append(sample['vol'])
+            data['ret_3'].append(sample['ret_3'])
+            data['ret_10'].append(sample['ret_10'])
+            data['trend_10'].append(sample['trend_10'])
+            data['trend_20'].append(sample['trend_20'])
+            data['vol_10'].append(sample['vol_10'])
+            data['vol_20'].append(sample['vol_20'])
+            data['zscore_20'].append(sample['zscore_20'])
+            data['momentum_ratio'].append(sample['momentum_ratio'])
+            data['output'].append(label)
+
+        df_dataset = pd.DataFrame(data)
+
+        if df_dataset.empty and not allow_empty:
+            df_dataset = pd.DataFrame({
+                'input1': [format(0, "08b")],
+                'input2': [format(1, "08b")],
+                'hour': [format(0, "05b")],
+                'ret_1': [0.0],
+                'range_1': [0.0],
+                'trend': [0.0],
+                'vol': [0.0],
+                'ret_3': [0.0],
+                'ret_10': [0.0],
+                'trend_10': [0.0],
+                'trend_20': [0.0],
+                'vol_10': [0.0],
+                'vol_20': [0.0],
+                'zscore_20': [0.0],
+                'momentum_ratio': [0.0],
+                'output': [0.0]
+            })
+
+        return df_dataset
+
+
+    def get_operational_close_threshold(self):
+        if self.close_threshold_history:
+            recent = self.close_threshold_history[-self.close_threshold_history_window:]
+            threshold = float(np.median(recent))
+        else:
+            threshold = self.info_score.get("best_threshold", self.close_threshold_floor)
+
+        threshold = max(threshold, self.close_threshold_floor)
+        threshold = min(threshold, self.close_threshold_ceiling)
+        return float(threshold)
+
+
+    def split_threshold_validation_trades(self, lista_pips):
+        trades_with_prob = [item for item in lista_pips if item.get("prob") is not None]
+        if len(trades_with_prob) < (self.threshold_min_calibration_trades + self.threshold_min_selected_trades):
+            return trades_with_prob, trades_with_prob
+
+        split_idx = int(len(trades_with_prob) * self.threshold_validation_split_ratio)
+        split_idx = max(self.threshold_min_calibration_trades, split_idx)
+        split_idx = min(split_idx, len(trades_with_prob) - self.threshold_min_selected_trades)
+
+        calibration = trades_with_prob[:split_idx]
+        scoring = trades_with_prob[split_idx:]
+        if not scoring:
+            scoring = calibration
+        return calibration, scoring
+
+
+    def score_threshold_subset(self, trade_subset, threshold):
+        selected = [
+            item["pips"]
+            for item in trade_subset
+            if item.get("prob") is not None and item["prob"] >= threshold
+        ]
+
+        if len(selected) < self.threshold_min_selected_trades:
+            return None
+
+        expectancy = float(np.mean(selected))
+        gross_profit = float(sum(value for value in selected if value > 0))
+        gross_loss = float(abs(sum(value for value in selected if value < 0)))
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else (2.0 if gross_profit > 0 else 0.0)
+        equity_curve = np.cumsum(selected)
+        running_max = np.maximum.accumulate(equity_curve)
+        drawdowns = equity_curve - running_max
+        max_drawdown = float(abs(drawdowns.min())) if len(drawdowns) else 0.0
+        drawdown_ratio = max_drawdown / max(abs(float(sum(selected))), 1.0)
+        score = (
+            (expectancy * np.sqrt(len(selected))) +
+            (min(profit_factor, 3.0) * 2.0) -
+            (drawdown_ratio * 2.0)
+        )
+        return {
+            "score": float(score),
+            "selected_trades": int(len(selected)),
+            "expectancy": expectancy,
+            "profit_factor": float(profit_factor),
+            "drawdown_ratio": float(drawdown_ratio),
+        }
+
+
+    def find_best_threshold(self, lista_pips):
+        calibration_trades, scoring_trades = self.split_threshold_validation_trades(lista_pips)
+        thresholds = np.linspace(self.close_threshold_floor, self.close_threshold_ceiling, 15)
+        best_thr = self.get_operational_close_threshold()
+        best_score = -np.inf
+        best_calibration_stats = None
+
+        for thr in thresholds:
+            calibration_stats = self.score_threshold_subset(calibration_trades, float(thr))
+            if calibration_stats is None:
+                continue
+
+            if calibration_stats["score"] > best_score:
+                best_score = calibration_stats["score"]
+                best_thr = float(thr)
+                best_calibration_stats = calibration_stats
+
+        if best_calibration_stats is None:
+            fallback_thr = self.get_operational_close_threshold()
+            fallback_score_stats = self.score_threshold_subset(scoring_trades, fallback_thr)
+            fallback_score = fallback_score_stats["score"] if fallback_score_stats else 0.0
+            return {
+                "threshold": float(fallback_thr),
+                "raw_threshold": float(fallback_thr),
+                "score": float(fallback_score),
+                "calibration_trades": int(len(calibration_trades)),
+                "scoring_trades": int(len(scoring_trades)),
+                "smoothed": bool(self.close_threshold_history),
+            }
+
+        self.close_threshold_history.append(best_thr)
+        smoothed_thr = self.get_operational_close_threshold()
+        scoring_stats = self.score_threshold_subset(scoring_trades, smoothed_thr)
+        scoring_score = scoring_stats["score"] if scoring_stats else 0.0
+
+        return {
+            "threshold": float(smoothed_thr),
+            "raw_threshold": float(best_thr),
+            "score": float(scoring_score),
+            "calibration_trades": int(len(calibration_trades)),
+            "scoring_trades": int(len(scoring_trades)),
+            "smoothed": True,
         }
         
 
     def preload_data(self):
 
         ini = time.time()
+
         # CLOSE
         FILES_OS_CLOSE = {
             f.split('_')[0]: f
@@ -650,10 +1055,12 @@ class Backtester:
         }
 
         for nodo in self.nodos_close:
+
             path_is = f'output/{self.principal_symbol}/extrac/{nodo["file"]}'
             file_base = nodo["file"].split('_')[0]
             file_os = FILES_OS_CLOSE[file_base]
             path_os = f'output/{self.principal_symbol}/extrac_os/{file_os}'
+
             self.COMBINED[("close", nodo["file"])] = self.build_combined(path_is, path_os)
 
         # OPEN
@@ -686,466 +1093,96 @@ class Backtester:
 
     def train_iteration(self):
 
-        mode = "train"
         path_data_red = f'output/{self.principal_symbol}/data_for_neuronal/data/data_{self.mercado}_{self.algorithm}.csv'
-        model_path = f"output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.json"
-        fallback_input_dim = 26  # 8+8 bits + 6 ctx cierre + 4 ctx apertura
-        MIN_TRADES_TO_LEARN = 30
-        epsilon = max(0.01, 0.10 * (0.97 ** max(0, self.index - 1)))
+        dict_pips_mean = self.collect_training_pips_map(self.df_train_A)
 
-        if not os.path.exists(path_data_red):
-            print("⚠️ No hay dataset aún, modo bootstrap")
-            X, Y = None, None
-        else:
-            try:
-                result = load_data(path_data_red)
-                X, Y = result[0], result[1]  # Compatible con (X, Y, sample_weight)
-                if len(X) < 20:
-                    print("⚠️ Dataset muy pequeño, modo bootstrap")
-                    X, Y = None, None
-            except Exception as e:
-                print(f"⚠️ Error cargando dataset: {e}")
-                X, Y = None, None
-
-        if os.path.exists(model_path):
-            try:
-                nn = load_trained_model(
-                    model_path,
-                    input_dim=(X.shape[1] if X is not None else fallback_input_dim)
-                )
-            except Exception as e:
-                print(f"⚠️ Error cargando modelo, reiniciando: {e}")
-                nn = BinaryNN(input_dim=fallback_input_dim, lr=0.01, target_loss=0.10)
-        else:
-            print("⚠️ No hay modelo aún, creando modelo inicial")
-            nn = BinaryNN(input_dim=fallback_input_dim, lr=0.01, target_loss=0.10)
-
-        bootstrap_mode = (X is None or len(X) < MIN_TRADES_TO_LEARN)
-        if bootstrap_mode:
-            print("⚠️ Dataset insuficiente, usando modo exploración")
-
-        is_open = False
-        open_price_open = 0.0
-        spread_open = 0.0
-        entry_red_open = ''
-        cierre = 0
-        market_ctx_open = {}
-        time_open_trade = None
-        pred_open_edge = None
-
-        trade_samples = []
-
-        for row in self.df_train.itertuples():
-            
-            time_actual = row.Index
-            time_actual_np = np.datetime64(time_actual)
-            if not is_open:
-                if not self.horas_mercado[time_actual.hour]:
-                    continue
-            
-            open_price = row.open 
-
-            # =========================
-            # CIERRE
-            # =========================
-            if is_open:
-                cierre += 1
-                valid_closes = []
-
-                for nodo in self.nodos_close:
-
-                    df_struct = self.COMBINED[("close", nodo["file"])]
-                    pos = df_struct["index_values"].searchsorted(time_actual_np)
-                    if pos == 0:
-                        continue
-
-                    if self.cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
-                        nodo_close = self.maping_close[nodo["key"]]
-                        market_ctx = self._get_market_context(df_struct, pos - 1, time_actual, spread_open)
-                        clase, prob, pred = predict_from_inputs(
-                            nn,
-                            entry_red_open,
-                            nodo_close,
-                            atr=market_ctx["atr"],
-                            adx=market_ctx["adx"],
-                            rsi=market_ctx["rsi"],
-                            hour=market_ctx["hour"],
-                            spread=market_ctx["spread"],
-                            stoch=market_ctx["stoch"],
-                            atr_open=market_ctx_open.get("atr", 0.0),
-                            adx_open=market_ctx_open.get("adx", 0.0),
-                            rsi_open=market_ctx_open.get("rsi", 0.0),
-                            stoch_open=market_ctx_open.get("stoch", 50.0),
-                            # Cambio 3: Pasar market features
-                            returns_1=market_ctx.get("returns_1", 0.0),
-                            volatility=market_ctx.get("volatility", 0.0),
-                            trend=market_ctx.get("trend", 0.0),
-                            return_raw=True,
-                        )
-
-                        if bootstrap_mode:
-                            clase = 1
-                            prob = 1.0
-                            pred = 1.0
-                        elif nn.model is None:
-                            clase = random.randint(0, 1)
-                            pred = 0.1 if clase == 1 else -0.1
-                            prob = abs(pred)
-                        elif random.random() < epsilon:
-                            clase = random.randint(0, 1)
-                            pred = 0.1 if clase == 1 else -0.1
-                            prob = abs(pred)
-
-                        valid_closes.append((nodo_close, int(clase), float(prob), float(pred), market_ctx))
-
-                bar_high = float(getattr(row, 'high', open_price))
-                bar_low = float(getattr(row, 'low', open_price))
-                bar_close = float(getattr(row, 'close', open_price))
-                trade_pips, forced_intrabar_reason = self.calculate_trade_pips_with_sl_tp(
-                    open_price_open,
-                    bar_high,
-                    bar_low,
-                    bar_close,
-                    spread_open,
-                )
-
-                cerrar = False
-                reason = None
-
-                if forced_intrabar_reason == "SL":
-                    cerrar = True
-                    reason = "SL"
-                elif forced_intrabar_reason == "TP":
-                    cerrar = True
-                    reason = "TP"
-                elif trade_pips < self.hard_stop_pips:
-                    cerrar = True
-                    reason = "HARD_STOP"
-                elif trade_pips < self.max_loss_close_pips:
-                    cerrar = True
-                    reason = "RISK_LOSS"
-                elif cierre > self.max_trade_duration:
-                    cerrar = True
-                    reason = "TIMEOUT"
-                elif bootstrap_mode:
-                    cerrar = (cierre > random.randint(5, 50))
-                    if cerrar:
-                        reason = "BOOTSTRAP"
-                elif valid_closes:
-                    # Selección por ranking de edge real (pred), no por probabilidad/threshold legado
-                    best_close = max(valid_closes, key=lambda x: x[3])  # (nodo, clase, prob, pred, ctx)
-                    best_pred = best_close[3]
-
-                    if pred_open_edge is None:
-                        pred_open_edge = best_pred
-
-                    delta_pred = best_pred - pred_open_edge
-                    close_by_low_edge = best_pred < self.edge_threshold
-                    close_by_decay = best_pred < (pred_open_edge * self.edge_decay_factor)
-                    close_by_delta = delta_pred < self.edge_delta_threshold
-                    cerrar = bool(close_by_low_edge or close_by_decay or close_by_delta)
-                    if cerrar:
-                        reason = "MODEL"
-
-                if cierre > 200:
-                    print(f"⚠️ trade largo detectado: {cierre}")
-
-                if cerrar:
-                    if mode == "train":
-                        # Cambio 2 + 5: Guardar TODAS las decisiones de cierre con executed flag,
-                        # pero priorizar la mejor decisión cuando hay multi-closes
-                        if valid_closes:
-                            # Cambio 5: Identificar el mejor nodo por predicción cruda
-                            best_close = max(valid_closes, key=lambda x: x[3])
-                            best_nodo, _, _, best_pred, _ = best_close
-                            target_future, mfe_future, mae_future = self.compute_future_target(
-                                self.df_train,
-                                time_actual,
-                                open_price,
-                                horizon=self.future_horizon_bars,
-                            )
-                            if trade_pips < -20:
-                                target_future -= 10.0
                             
-                            # Guardar TODAS las decisiones, pero marcar cual fue ejecutada (la mejor)
-                            for nodo_close_selected, clase_selected, prob_selected, pred_selected, market_ctx_selected in valid_closes:
-                                is_best = (nodo_close_selected == best_nodo and pred_selected == best_pred)
-                                trade_samples.append({
-                                    "open_signal": entry_red_open,
-                                    "close_signal": nodo_close_selected,
-                                    "time_open": str(time_open_trade) if time_open_trade is not None else "",
-                                    "time_close": str(time_actual),
-                                    "atr": market_ctx_selected["atr"],
-                                    "adx": market_ctx_selected["adx"],
-                                    "rsi": market_ctx_selected["rsi"],
-                                    "stoch": market_ctx_selected["stoch"],
-                                    "hour": market_ctx_selected["hour"],
-                                    "spread": market_ctx_selected["spread"],
-                                    "atr_open": market_ctx_open.get("atr", 0.0),
-                                    "adx_open": market_ctx_open.get("adx", 0.0),
-                                    "rsi_open": market_ctx_open.get("rsi", 0.0),
-                                    "stoch_open": market_ctx_open.get("stoch", 50.0),
-                                    "profit": target_future,
-                                    "profit_real": trade_pips,
-                                    "mfe_future": mfe_future,
-                                    "mae_future": mae_future,
-                                    # Nueva información: flags de decisión
-                                    # Con Cambio 5: solo la mejor es realmente ejecutada
-                                    "executed": (reason in ["MODEL", "BOOTSTRAP"] and is_best),
-                                    "reason": reason,  # Razón del cierre (SL/TP/MODEL/etc)
-                                })
-                        
-                        # Si no hay valid_closes (e.g., timeout, SL, TP), crear una entrada de cierre forzado
-                        if not valid_closes:
-                            target_future, mfe_future, mae_future = self.compute_future_target(
-                                self.df_train,
-                                time_actual,
-                                open_price,
-                                horizon=self.future_horizon_bars,
-                            )
-                            if trade_pips < -20:
-                                target_future -= 10.0
-                            trade_samples.append({
-                                "open_signal": entry_red_open,
-                                "close_signal": "FORCED",
-                                "time_open": str(time_open_trade) if time_open_trade is not None else "",
-                                "time_close": str(time_actual),
-                                "atr": market_ctx_open.get("atr", 0.0),
-                                "adx": market_ctx_open.get("adx", 0.0),
-                                "rsi": market_ctx_open.get("rsi", 0.0),
-                                "stoch": market_ctx_open.get("stoch", 50.0),
-                                "hour": float(time_actual.hour),
-                                "spread": float(spread_open),
-                                "atr_open": market_ctx_open.get("atr", 0.0),
-                                "adx_open": market_ctx_open.get("adx", 0.0),
-                                "rsi_open": market_ctx_open.get("rsi", 0.0),
-                                "stoch_open": market_ctx_open.get("stoch", 50.0),
-                                "profit": target_future,
-                                "profit_real": trade_pips,
-                                "mfe_future": mfe_future,
-                                "mae_future": mae_future,
-                                "executed": reason in ["SL", "TP", "TIMEOUT", "RISK_LOSS", "HARD_STOP"],  # Forzado pero ejecutado
-                                "reason": reason,
-                            })
-
-                    is_open = False
-                    time_open_trade = None
-                    pred_open_edge = None
-                    print(f"CLOSE [{reason}] {time_actual} | pips={trade_pips:.2f} | dur={cierre}")
-                    cierre = 0
-
-            # =========================
-            # APERTURA
-            # =========================
-            else:
-
-                cierre = 0
-
-                for symbol in self.list_symbols:
-
-                    cumple_alguno = False
-                    nodo_open_list = self.dict_nodos[symbol]
-
-                    for nodo in nodo_open_list:
-
-                        df_struct = self.COMBINED[("open", symbol, nodo["file"])]
-                        pos = df_struct["index_values"].searchsorted(time_actual_np)
-                        if pos == 0:
-                            continue
-
-                        if bootstrap_mode and random.random() < 0.02:
-                            cumple_alguno = True
-
-                            if symbol == self.list_symbols[-1]:
-                                open_price_open = open_price
-                                spread_open = getattr(row, 'spread', 0.0)
-                                is_open = True
-                                time_open_trade = time_actual
-                                nodo_open = self.maping_open[nodo["key"]]
-                                entry_red_open = nodo_open
-                                market_ctx_open = self._get_market_context(df_struct, pos - 1, time_actual, spread_open)
-                                pred_open_edge = None
-
-                                # Filtro de entrada por edge (evita aperturas con señal débil)
-                                if not bootstrap_mode and nn.model is not None:
-                                    _, _, open_pred = self.compute_best_open_edge(
-                                        nn,
-                                        entry_red_open,
-                                        time_actual_np,
-                                        time_actual,
-                                        spread_open,
-                                        market_ctx_open,
-                                    )
-                                    if open_pred is not None and open_pred < self.min_open_edge:
-                                        is_open = False
-                                        pred_open_edge = None
-                                        cumple_alguno = False
-                                    else:
-                                        pred_open_edge = open_pred if open_pred is not None else 0.0
-
-                            break
-
-                        if self.cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
-
-                            cumple_alguno = True
-
-                            if symbol == self.list_symbols[-1]:
-                                open_price_open = open_price
-                                spread_open = getattr(row, 'spread', 0.0)
-                                is_open = True
-                                time_open_trade = time_actual
-                                nodo_open = self.maping_open[nodo["key"]]
-                                entry_red_open = nodo_open
-                                market_ctx_open = self._get_market_context(df_struct, pos - 1, time_actual, spread_open)
-                                pred_open_edge = None
-
-                                # Filtro de entrada por edge (evita aperturas con señal débil)
-                                if not bootstrap_mode and nn.model is not None:
-                                    _, _, open_pred = self.compute_best_open_edge(
-                                        nn,
-                                        entry_red_open,
-                                        time_actual_np,
-                                        time_actual,
-                                        spread_open,
-                                        market_ctx_open,
-                                    )
-                                    if open_pred is not None and open_pred < self.min_open_edge:
-                                        is_open = False
-                                        pred_open_edge = None
-                                        cumple_alguno = False
-                                    else:
-                                        pred_open_edge = open_pred if open_pred is not None else 0.0
-
-                            break
-
-                    if not cumple_alguno:
-                        break
-
-        trade_dataset_dir = f'output/{self.principal_symbol}/data_for_neuronal/trade_dataset'
-        os.makedirs(trade_dataset_dir, exist_ok=True)
-        trade_dataset_path = f'{trade_dataset_dir}/trade_dataset_{self.mercado}_{self.algorithm}.csv'
-        trade_df = pd.DataFrame(trade_samples)
-        if not trade_df.empty:
-            exists = os.path.exists(trade_dataset_path)
-            trade_df.to_csv(
-                trade_dataset_path,
-                mode='a' if exists else 'w',
-                header=not exists,
-                index=False
-            )
-        print(f"Trade dataset actualizado en: {trade_dataset_path} (+{len(trade_samples)} samples)")
+        # =========================
+        # SELECCIÓN TOP/BOTTOM
+        # =========================
+        if self.index == 1:
+            self.dict_pips_best = dict_pips_mean
+        else:        
+            self.dict_pips_best = self.actualizar_dict(self.dict_pips_best, dict_pips_mean)
+        print(len(self.dict_pips_best), "pips para actualizar en la próxima iteración")
 
         # =========================
         # REENTRENAMIENTO
         # =========================
 
-        config = {
-            "general": self.general_config,
-            "symbol": self.config_symbol,
-            "principal_symbol": self.principal_symbol
-        }
-        data_for_neuronal(
-            config,
-            self.mercado,
-            self.algorithm,
-            dict_pips_best=None,
-            trade_samples=trade_samples
+        df_dataset = self.build_walk_forward_dataset(self.df_train_B, self.dict_pips_best)
+        df_dataset.to_csv(path_data_red, index=False)
+
+        input1_ids, input2_ids, hour_ids, X_extra, Y, norm_stats = load_data(path_data_red, return_stats=True)
+
+        print("Datos cargados:")
+        print("X_extra shape:", X_extra.shape)
+        print("Y shape:", Y.shape)
+
+        num_open, num_close, num_hours = get_embedding_vocab_sizes(input1_ids, input2_ids, hour_ids)
+        nn = BinaryNN(
+            input_dim_extra=X_extra.shape[1],
+            num_open=num_open,
+            num_close=num_close,
+            num_hours=num_hours,
+            lr=0.001,
+            target_loss=0.10,
         )
+        nn.feature_mean = norm_stats["mean"]
+        nn.feature_std = norm_stats["std"]
+        nn.fit(input1_ids, input2_ids, hour_ids, X_extra, Y, epochs=200, batch_size=32)
 
-        if os.path.exists(path_data_red):
-            try:
-                result = load_data(path_data_red)
-                X, Y = result[0], result[1]  # Compatible con (X, Y, sample_weight)
-                sample_weight = result[2] if len(result) > 2 else None
-            except Exception as e:
-                print(f"⚠️ Dataset inválido → se omite entrenamiento: {e}")
-                X, Y = None, None
-                sample_weight = None
+        model_path = f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.pt'
+        save_trained_model(nn, model_path)
 
-            if X is None or Y is None:
-                print("⚠️ No se pudo cargar dataset válido en esta iteración")
-            else:
-                print("Datos cargados:")
-                print("X shape:", X.shape)
-                print("Y shape:", Y.shape)
+        print(f"Modelo entrenado guardado en '{model_path}'")
 
-                # Continuar entrenamiento desde el modelo existente (no resetear)
-                if len(X) >= MIN_TRADES_TO_LEARN:
-                    if nn.model is None:
-                        nn.fit(X, Y, epochs=20000, batch_size=32, sample_weight=sample_weight)
-                    else:
-                        y_reg = Y.ravel().astype(np.float32)
-                        if sample_weight is not None:
-                            nn.model.fit(X, y_reg, sample_weight=sample_weight)
-                        else:
-                            nn.model.fit(X, y_reg)
-                        payload = _serialize_xgb_to_base64(nn.model)
-                        nn.W1 = np.array([f"__XGB__{payload}"], dtype=object)
-                    nn.input_dim = X.shape[1]
-                else:
-                    print(f"⚠️ Dataset insuficiente para entrenar (>={MIN_TRADES_TO_LEARN} requerido)")
-        else:
-            print("⚠️ No hay dataset, no se entrena en esta iteración")
-
-        model_data = {
-            'W1': nn.W1.tolist(),
-            'b1': nn.b1.tolist(),
-            'W2': nn.W2.tolist(),
-            'b2': nn.b2.tolist(),
-            'W3': nn.W3.tolist(),
-            'b3': nn.b3.tolist(),
-            'W4': nn.W4.tolist(),
-            'b4': nn.b4.tolist()
+        return {
+            "model_type": "embedding",
+            "input_dim_extra": nn.input_dim_extra,
+            "num_open": nn.num_open,
+            "num_close": nn.num_close,
+            "num_hours": nn.num_hours,
+            "emb_open_dim": nn.emb_open_dim,
+            "emb_close_dim": nn.emb_close_dim,
+            "emb_hour_dim": nn.emb_hour_dim,
+            "dropout_rate": nn.dropout_rate,
+            "weight_decay": nn.weight_decay,
+            "false_positive_cost_ratio": nn.false_positive_cost_ratio,
+            "state_dict": {k: v.detach().cpu() for k, v in nn.state_dict().items()},
+            "feature_mean": None if nn.feature_mean is None else np.asarray(nn.feature_mean, dtype=np.float32).tolist(),
+            "feature_std": None if nn.feature_std is None else np.asarray(nn.feature_std, dtype=np.float32).tolist(),
         }
-
-        tmp_path = model_path + ".tmp"
-        with open(tmp_path, 'w') as f:
-            json.dump(model_data, f, indent=4)
-        os.replace(tmp_path, model_path)
-
-        print(f"Modelo guardado en '{model_path}'")
-
-        return model_data
     
   
     def validate_iteration(self):
 
         path_data_red = f'output/{self.principal_symbol}/data_for_neuronal/data/data_{self.mercado}_{self.algorithm}.csv'
-        model_path = f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.json'
-        fallback_input_dim = 26
+        input1_ids, input2_ids, hour_ids, X_extra, Y = load_data(path_data_red)
 
-        input_dim = fallback_input_dim
-        if os.path.exists(path_data_red):
-            try:
-                result = load_data(path_data_red)
-                X, Y = result[0], result[1]  # Compatible con (X, Y, sample_weight)
-                if len(X) > 0:
-                    input_dim = X.shape[1]
-            except Exception:
-                pass
+        nn = load_trained_model(
+            f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.pt',
+            input_dim_extra=X_extra.shape[1]
+        )
+        validate_embedding_vocab(nn, input1_ids, input2_ids, hour_ids)
 
-        if os.path.exists(model_path):
-            try:
-                nn = load_trained_model(
-                    model_path,
-                    input_dim=input_dim
-                )
-            except Exception as e:
-                print(f"⚠️ Modelo corrupto detectado, reset: {e}")
-                nn = BinaryNN(input_dim=input_dim, lr=0.01, target_loss=0.10)
-                nn.model = None
-        else:
-            nn = BinaryNN(input_dim=input_dim, lr=0.01, target_loss=0.10)
-            nn.model = None
+        df_validation = self.get_validation_window_df()
+        validation_start = df_validation.index.min()
+        validation_end = df_validation.index.max()
+        print(
+            f"Validando sobre los últimos {self.validation_window_months} meses: "
+            f"{validation_start} -> {validation_end} | barras={len(df_validation)}"
+        )
 
         is_open = False
         open_price_open = 0.0
         spread_open = 0.0
         entry_red_open = ''
         cierre = 0
+        model_close_streak = 0
         time_comienzo = None
-        market_ctx_open = {}
-        pred_open_edge = None
+        current_stop_loss = self.stop_loss
+        current_take_profit = self.take_profit
 
         cantidad_operaciones = 0
         operaciones_acertadas = 0
@@ -1156,113 +1193,101 @@ class Backtester:
         sum_pips = 0.0
 
         lista_pips = []
+        holding_bars_list = []
+        close_reason_counts = {
+            "stop_loss": 0,
+            "take_profit": 0,
+            "max_holding": 0,
+            "model": 0,
+        }
         perdidas_seguidas = 0
         mas_perdidas_seguidas = 0
+        close_threshold = self.get_operational_close_threshold()
 
-        for row in self.df_valid.itertuples():
+        for row in df_validation.itertuples():
 
             time_actual = row.Index
             time_actual_np = np.datetime64(time_actual)
             if not is_open:
                 if not self.horas_mercado[time_actual.hour]:
                     continue
+                
             open_price = row.open
+            hour = format(time_actual.hour, "05b")
+            market_features = self.get_market_features(row)
 
             # =========================
             # CIERRE
             # =========================
             if is_open:
                 cierre += 1
-                valid_closes = []
-                for nodo in self.nodos_close:
-                    df_struct = self.COMBINED[("close", nodo["file"])]
-                    pos = df_struct["index_values"].searchsorted(time_actual_np)
-                    if pos == 0:
-                        continue
-
-                    if self.cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
-
-                        nodo_close = self.maping_close[nodo["key"]]
-                        market_ctx = self._get_market_context(df_struct, pos - 1, time_actual, spread_open)
-                        clase, prob, pred = predict_from_inputs(
-                            nn,
-                            entry_red_open,
-                            nodo_close,
-                            atr=market_ctx["atr"],
-                            adx=market_ctx["adx"],
-                            rsi=market_ctx["rsi"],
-                            hour=market_ctx["hour"],
-                            spread=market_ctx["spread"],
-                            stoch=market_ctx["stoch"],
-                            atr_open=market_ctx_open.get("atr", 0.0),
-                            adx_open=market_ctx_open.get("adx", 0.0),
-                            rsi_open=market_ctx_open.get("rsi", 0.0),
-                            stoch_open=market_ctx_open.get("stoch", 50.0),
-                            # Cambio 3: Pasar market features
-                            returns_1=market_ctx.get("returns_1", 0.0),
-                            volatility=market_ctx.get("volatility", 0.0),
-                            trend=market_ctx.get("trend", 0.0),
-                            return_raw=True,
-                        )
-                        if nn.model is None:
-                            clase = random.randint(0, 1)
-                            pred = 0.1 if clase == 1 else -0.1
-                            prob = abs(pred)
-                        valid_closes.append((int(clase), float(prob), float(pred)))
-
-                bar_high = float(getattr(row, 'high', open_price))
-                bar_low = float(getattr(row, 'low', open_price))
-                bar_close = float(getattr(row, 'close', open_price))
-                trade_pips, forced_intrabar_reason = self.calculate_trade_pips_with_sl_tp(
+                current_pips = self.calculate_trade_pips(
                     open_price_open,
-                    bar_high,
-                    bar_low,
-                    bar_close,
+                    open_price,
                     spread_open,
                 )
+                prob = None
+                close_reason = None
+                if current_pips <= -current_stop_loss:
+                    structural_close = True
+                    close_reason = "stop_loss"
+                elif current_pips >= current_take_profit:
+                    structural_close = True
+                    close_reason = "take_profit"
+                elif cierre >= self.max_holding:
+                    structural_close = True
+                    close_reason = "max_holding"
+                else:
+                    structural_close = False
+                model_close_signal = False
+                if (not structural_close) and cierre >= self.min_model_holding:
+                    for nodo in self.nodos_close:
+                        df_struct = self.COMBINED[("close", nodo["file"])]
+                        pos = df_struct["index_values"].searchsorted(time_actual_np)
+                        if pos == 0:
+                            continue
 
-                cerrar = False
-                reason = None
-                if forced_intrabar_reason == "SL":
-                    cerrar = True
-                    reason = "SL"
-                elif forced_intrabar_reason == "TP":
-                    cerrar = True
-                    reason = "TP"
-                elif trade_pips < self.hard_stop_pips:
-                    cerrar = True
-                    reason = "HARD_STOP"
-                elif trade_pips < self.max_loss_close_pips:
-                    cerrar = True
-                    reason = "RISK_LOSS"
-                elif cierre > self.max_trade_duration:
-                    cerrar = True
-                    reason = "TIMEOUT"
-                elif valid_closes:
-                    best_close = max(valid_closes, key=lambda x: x[2])  # (clase, prob, pred)
-                    best_pred = best_close[2]
+                        if self.cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
 
-                    if pred_open_edge is None:
-                        pred_open_edge = best_pred
+                            nodo_close = self.maping_close[nodo["key"]]
+                            prob = predict_from_inputs(nn, entry_red_open, nodo_close, hour, market_features)
+                            if prob > close_threshold:
+                                model_close_signal = True
+                                break
 
-                    delta_pred = best_pred - pred_open_edge
-                    close_by_low_edge = best_pred < self.edge_threshold
-                    close_by_decay = best_pred < (pred_open_edge * self.edge_decay_factor)
-                    close_by_delta = delta_pred < self.edge_delta_threshold
-                    cerrar = bool(close_by_low_edge or close_by_decay or close_by_delta)
-                    if cerrar:
-                        reason = "MODEL"
+                if model_close_signal:
+                    model_close_streak += 1
+                else:
+                    model_close_streak = 0
+
+                if (not structural_close) and model_close_streak >= self.close_confirmation_bars:
+                    close_reason = "model"
+
+                cerrar = structural_close or (model_close_streak >= self.close_confirmation_bars)
+
                 if cerrar:
+                    trade_pips = current_pips
+
                     if trade_pips < 0:
                         perdidas_seguidas += 1
                     else:
                         perdidas_seguidas = 0
 
                     is_open = False
-                    pred_open_edge = None
+                    model_close_streak = 0
                     cantidad_operaciones += 1
                     sum_pips += trade_pips
-                    lista_pips.append(trade_pips)
+                    holding_bars_list.append(cierre)
+                    if close_reason is not None:
+                        close_reason_counts[close_reason] += 1
+                    lista_pips.append({
+                        "pips": trade_pips,
+                        "prob": prob,
+                        "bars_held": cierre,
+                        "close_reason": close_reason,
+                        "time_open": time_comienzo.isoformat() if hasattr(time_comienzo, "isoformat") else str(time_comienzo),
+                        "time_close": time_actual.isoformat() if hasattr(time_actual, "isoformat") else str(time_actual),
+                    })
 
                     if trade_pips > 0:
                         operaciones_acertadas += 1
@@ -1271,8 +1296,7 @@ class Backtester:
                         operaciones_perdedoras += 1
                         perdida_bruta += abs(trade_pips)
 
-                    print(f"CLOSE [{reason}] {time_comienzo} -> {time_actual}: {sum_pips:.2f}")
-                    cierre = 0
+                    print(f"SUM PIPS:{time_comienzo} ---- {time_actual}: {sum_pips}", cierre)
 
             # =========================
             # APERTURA
@@ -1301,29 +1325,12 @@ class Backtester:
                             if symbol == self.list_symbols[-1]:
                                 open_price_open = open_price
                                 spread_open = getattr(row, 'spread', 0.0)
+                                current_stop_loss, current_take_profit = self.get_trade_risk_limits(row)
                                 is_open = True
                                 time_comienzo = time_actual
+                                model_close_streak = 0
                                 nodo_open = self.maping_open[nodo["key"]]
                                 entry_red_open = nodo_open
-                                market_ctx_open = self._get_market_context(df_struct, pos - 1, time_actual, spread_open)
-                                pred_open_edge = None
-
-                                # Filtro de entrada por edge en validación
-                                if nn.model is not None:
-                                    _, _, open_pred = self.compute_best_open_edge(
-                                        nn,
-                                        entry_red_open,
-                                        time_actual_np,
-                                        time_actual,
-                                        spread_open,
-                                        market_ctx_open,
-                                    )
-                                    if open_pred is not None and open_pred < self.min_open_edge:
-                                        is_open = False
-                                        pred_open_edge = None
-                                        cumple_alguno = False
-                                    else:
-                                        pred_open_edge = open_pred if open_pred is not None else 0.0
 
                             break
 
@@ -1349,9 +1356,40 @@ class Backtester:
 
         expectancy = (winrate * avg_win) - ((1 - winrate) * avg_loss)
 
+        pips_values = [item["pips"] for item in lista_pips]
         sharpe = 0
-        if len(lista_pips) > 1 and np.std(lista_pips) != 0:
-            sharpe = np.mean(lista_pips) / np.std(lista_pips)
+        if len(pips_values) > 1 and np.std(pips_values) != 0:
+            sharpe = np.mean(pips_values) / np.std(pips_values)
+
+        max_drawdown = 0.0
+        if pips_values:
+            equity_curve = np.cumsum(pips_values)
+            running_max = np.maximum.accumulate(equity_curve)
+            drawdowns = equity_curve - running_max
+            max_drawdown = float(drawdowns.min())
+
+        avg_bars_held = float(np.mean(holding_bars_list)) if holding_bars_list else 0.0
+        median_bars_held = float(np.median(holding_bars_list)) if holding_bars_list else 0.0
+        max_drawdown_abs = abs(max_drawdown)
+        drawdown_denominator = max(abs(sum_pips), 1.0)
+        max_drawdown_ratio = float(max_drawdown_abs / drawdown_denominator)
+        calmar_ratio = float(sum_pips / max_drawdown_abs) if max_drawdown_abs > 0 else (3.0 if sum_pips > 0 else 0.0)
+        negative_pips = [value for value in pips_values if value < 0]
+        if len(negative_pips) > 1 and np.std(negative_pips) != 0:
+            sortino_ratio = float(np.mean(pips_values) / np.std(negative_pips))
+        elif pips_values and np.mean(pips_values) > 0:
+            sortino_ratio = 3.0
+        else:
+            sortino_ratio = 0.0
+        temporal_stats = self.summarize_temporal_performance(lista_pips)
+
+        threshold_info = self.find_best_threshold(lista_pips)
+        best_thr = threshold_info["threshold"]
+        best_threshold_score = threshold_info["score"]
+        print(
+            f"Best threshold: {best_thr:.3f} | Score: {best_threshold_score:.4f} | "
+            f"raw={threshold_info['raw_threshold']:.3f}"
+        )
 
         print(f"""
         Operaciones: {cantidad_operaciones}
@@ -1361,22 +1399,40 @@ class Backtester:
         Pips Totales: {sum_pips:.2f}
         """)
 
-        max_drawdown = self._max_drawdown_from_pips(lista_pips)
-
-        return {
+        metrics = {
             "winrate": winrate,
             "profit_factor": profit_factor,
             "expectancy": expectancy,
+            "lista_pips": lista_pips,
+            "best_threshold": best_thr,
+            "best_threshold_raw": threshold_info["raw_threshold"],
+            "best_threshold_score": best_threshold_score,
+            "best_threshold_meta": threshold_info,
+            "operational_close_threshold": close_threshold,
             "sharpe": sharpe,
+            "calmar_ratio": calmar_ratio,
+            "sortino_ratio": sortino_ratio,
+            "max_drawdown": max_drawdown,
+            "max_drawdown_ratio": max_drawdown_ratio,
+            "avg_bars_held": avg_bars_held,
+            "median_bars_held": median_bars_held,
+            "close_reason_counts": close_reason_counts,
+            "temporal_stats": temporal_stats,
+            "validation_window": {
+                "months": self.validation_window_months,
+                "start": validation_start.isoformat() if hasattr(validation_start, "isoformat") else str(validation_start),
+                "end": validation_end.isoformat() if hasattr(validation_end, "isoformat") else str(validation_end),
+                "bars": int(len(df_validation)),
+            },
             "cantidad_operaciones": cantidad_operaciones,
             "sum_pips": sum_pips,
-            "lista_pips": lista_pips,
-            "mas_perdidas_seguidas": mas_perdidas_seguidas,
-            "max_drawdown": max_drawdown,
+            "mas_perdidas_seguidas": mas_perdidas_seguidas
         }
+        metrics["selection_reference"] = self.build_selection_reference(metrics)
+        return metrics
     
 
-    def calculate_score(self, metrics, model_data):
+    def calculate_preliminary_score(self, metrics):
 
         profit_factor_adj = min(metrics["profit_factor"], 5)
         sharpe_adj = min(metrics["sharpe"], 3)
@@ -1393,163 +1449,226 @@ class Backtester:
         reliability_factor = n_ops / (n_ops + self.trade_reliability_k) if n_ops > 0 else 0.0
         min_trades_factor = min(1.0, n_ops / self.min_trades_score) if self.min_trades_score > 0 else 1.0
         low_trade_penalty = min_trades_factor ** self.low_trade_penalty_power
-        max_drawdown = float(metrics.get("max_drawdown", 0.0))
-        dd_penalty = max_drawdown * 0.1
-        std_pips = float(np.std(metrics["lista_pips"])) if metrics["lista_pips"] else 0.0
-        # Penalización de consistencia suavizada para no castigar en exceso sistemas con winners grandes
-        consistency = 1.0 / (1.0 + (std_pips * 0.01))
 
         score = score_base * volumen_factor * reliability_factor * low_trade_penalty
-        score = (score - dd_penalty) * consistency
 
+        return {
+            "score": float(score),
+            "score_base": float(score_base),
+            "volumen_factor": float(volumen_factor),
+            "reliability_factor": float(reliability_factor),
+            "low_trade_penalty": float(low_trade_penalty),
+        }
+
+
+    def percentile_rank(self, values, value):
+        if not values:
+            return 0.5
+
+        less_count = sum(1 for item in values if item < value)
+        equal_count = sum(1 for item in values if item == value)
+        return float((less_count + 0.5 * equal_count) / len(values))
+
+
+    def finalize_best_candidate(self, last_model_data):
+        eligible_candidates = [
+            candidate
+            for candidate in self.iteration_candidates
+            if candidate["metrics"]["iteracion"] >= self.min_winning_iteration
+        ]
+
+        if not eligible_candidates:
+            if self.iteration_candidates:
+                fallback_candidate = self.iteration_candidates[-1]
+                self.best_model_data = fallback_candidate["model_data"]
+                fallback_metrics = dict(fallback_candidate["metrics"])
+                fallback_metrics["score"] = fallback_metrics.get("preliminary_score", 0.0)
+                fallback_metrics["score_model"] = "preliminary_fallback"
+                fallback_metrics["peor_trade"] = min((item["pips"] for item in fallback_metrics["lista_pips"]), default=0)
+                self.info_score = fallback_metrics
+                del self.info_score["lista_pips"]
+                self.best_score = fallback_metrics["score"]
+            elif self.best_model_data is None:
+                self.best_model_data = last_model_data
+            return
+
+        metric_values = {
+            metric_name: [candidate["metrics"].get(metric_name, 0.0) for candidate in eligible_candidates]
+            for metric_name in self.robust_score_weights
+        }
+
+        best_candidate = None
+        best_robust_score = float("-inf")
+        ranked_candidates = []
+
+        for candidate in eligible_candidates:
+            metrics = candidate["metrics"]
+            score_components = {}
+            for metric_name, weight in self.robust_score_weights.items():
+                percentile = self.percentile_rank(metric_values[metric_name], metrics.get(metric_name, 0.0))
+                score_components[metric_name] = float(percentile * weight)
+
+            robust_score_base = float(sum(score_components.values()))
+            n_ops = metrics.get("cantidad_operaciones", 0)
+            trade_penalty = float(
+                1.0 / (1.0 + np.exp(-(n_ops - self.robust_trade_penalty_center) / self.robust_trade_penalty_scale))
+            )
+            avg_bars = metrics.get("avg_bars_held", 0.0)
+            duration_penalty = 1.0 if avg_bars >= self.robust_min_avg_bars else float(max(0.75, avg_bars / max(self.robust_min_avg_bars, 1.0)))
+            robust_score = robust_score_base * trade_penalty * duration_penalty
+
+            metrics["score_components"] = score_components
+            metrics["score_base"] = robust_score_base
+            metrics["trade_penalty"] = trade_penalty
+            metrics["duration_penalty"] = duration_penalty
+            metrics["score_model"] = "percentile_batch_v1"
+            metrics["score"] = float(robust_score)
+            ranked_candidates.append(candidate)
+
+            if robust_score > best_robust_score:
+                best_robust_score = robust_score
+                best_candidate = candidate
+
+        if best_candidate is None:
+            if self.best_model_data is None:
+                self.best_model_data = last_model_data
+            return
+
+        self.best_score = float(best_robust_score)
+        self.best_model_data = best_candidate["model_data"]
+        best_metrics = dict(best_candidate["metrics"])
+        self.peor_trade = min((item["pips"] for item in best_metrics["lista_pips"]), default=0)
+        best_metrics["peor_trade"] = self.peor_trade
+
+        ranked_candidates.sort(key=lambda item: item["metrics"].get("score", float("-inf")), reverse=True)
+        top_candidates = ranked_candidates[:self.ensemble_top_k]
+        ensemble_weight_sum = 0.0
+        self.ensemble_model_entries = []
+        for rank, candidate in enumerate(top_candidates):
+            candidate_score = max(float(candidate["metrics"].get("score", 0.0)), 0.0) + 1e-6
+            weight = candidate_score * (self.ensemble_decay_factor ** rank)
+            ensemble_weight_sum += weight
+            self.ensemble_model_entries.append({
+                "model_data": candidate["model_data"],
+                "weight": float(weight),
+                "iteration": candidate["metrics"].get("iteracion"),
+                "score": candidate["metrics"].get("score"),
+                "threshold": candidate["metrics"].get("best_threshold", self.close_threshold_floor),
+            })
+
+        if ensemble_weight_sum > 0:
+            for entry in self.ensemble_model_entries:
+                entry["weight"] = float(entry["weight"] / ensemble_weight_sum)
+
+        ensemble_threshold = best_metrics.get("best_threshold", self.close_threshold_floor)
+        if self.ensemble_model_entries:
+            ensemble_threshold = float(sum(entry["weight"] * entry["threshold"] for entry in self.ensemble_model_entries))
+
+        best_metrics["ensemble"] = {
+            "enabled": len(self.ensemble_model_entries) > 1,
+            "top_k": len(self.ensemble_model_entries),
+            "decay_factor": self.ensemble_decay_factor,
+            "threshold": ensemble_threshold,
+            "members": [
+                {
+                    "iteration": entry["iteration"],
+                    "score": entry["score"],
+                    "weight": entry["weight"],
+                }
+                for entry in self.ensemble_model_entries
+            ],
+        }
+        self.info_score = best_metrics
+        self.info_score["best_threshold"] = best_metrics["best_threshold"]
+        del self.info_score["lista_pips"]
         print(
-            f"Score calculado: {score:.4f} | base={score_base:.4f} | ops={n_ops} | "
-            f"vol={volumen_factor:.4f} | rel={reliability_factor:.4f} | "
-            f"low_ops={low_trade_penalty:.4f} | dd_penalty={dd_penalty:.4f} | "
-            f"consistency={consistency:.4f}"
+            f"Mejor modelo final por percentil batch: iteración {best_metrics['iteracion']} | "
+            f"score={best_metrics['score']:.4f}"
         )
 
-        if score > self.best_score:
 
-            self.best_score = score
-            self.best_model_data = model_data
-            self.peor_trade = min(metrics["lista_pips"]) if metrics["lista_pips"] else 0
-            metrics["peor_trade"] = self.peor_trade
-            metrics["iteracion"] = self.index
-            metrics["score"] = score
-            metrics["score_base"] = score_base
-            metrics["volumen_factor"] = volumen_factor
-            metrics["reliability_factor"] = reliability_factor
-            metrics["low_trade_penalty"] = low_trade_penalty
-            metrics["dd_penalty"] = dd_penalty
-            metrics["consistency"] = consistency
-            self.info_score = self._compact_metrics(metrics)
-            print(f"Nuevo mejor modelo encontrado con score: {score:.4f}")
-        return score
+    def calculate_score(self, metrics, model_data):
+        preliminary = self.calculate_preliminary_score(metrics)
+        n_ops = metrics["cantidad_operaciones"]
+
+        print(
+            f"Score preliminar: {preliminary['score']:.4f} | base={preliminary['score_base']:.4f} | ops={n_ops} | "
+            f"vol={preliminary['volumen_factor']:.4f} | rel={preliminary['reliability_factor']:.4f} | "
+            f"low_ops={preliminary['low_trade_penalty']:.4f}"
+        )
+
+        metrics["iteracion"] = self.index
+        metrics["preliminary_score"] = preliminary["score"]
+        metrics["preliminary_score_base"] = preliminary["score_base"]
+        metrics["volumen_factor"] = preliminary["volumen_factor"]
+        metrics["reliability_factor"] = preliminary["reliability_factor"]
+        metrics["low_trade_penalty"] = preliminary["low_trade_penalty"]
+        self.iteration_candidates.append({
+            "metrics": metrics,
+            "model_data": model_data,
+        })
+
+        if self.index < self.min_winning_iteration:
+            print(
+                f"Iteración {self.index}: score preliminar ignorado para ganador; "
+                f"el mejor modelo solo se actualiza desde la iteración {self.min_winning_iteration}."
+            )
+            return preliminary["score"]
+
+        if preliminary["score"] > self.best_score:
+            self.best_score = preliminary["score"]
+            self.no_improve_iterations = 0
+            print(f"Nueva mejor referencia preliminar: {preliminary['score']:.4f}")
+        else:
+            self.no_improve_iterations += 1
+            print(
+                f"Sin mejora en score preliminar durante {self.no_improve_iterations} "
+                f"iteraciones elegibles consecutivas."
+            )
+        return preliminary["score"]
 
 
     def run(self):
-        model_path = f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.json'
-        score_path = f'output/{self.principal_symbol}/data_for_neuronal/best_score/score_{self.mercado}_{self.algorithm}.json'
+        last_model_data = None
 
-        if not self.use_wfo:
-            self._reset_iteration_state()
-            result = self._run_training_loop()
-            with open(model_path, 'w') as f:
-                json.dump(result["best_model_data"], f, indent=4)
-            with open(score_path, 'w') as f:
-                json.dump({
-                    "mode": "single_split",
-                    "winner": result["info_score"]
-                }, f, indent=4)
-            print(f'tiempo total: {time.time() - self.comienzo:.2f} segundos')
-            return
+        for i in range(self.max_iterations):
+            print(f"\n--- Iteración {i+1} ---")
+            self.index = i + 1
+            model_data = self.train_iteration()
+            last_model_data = model_data
+            metrics = self.validate_iteration()
+            self.calculate_score(metrics, model_data)
 
-        windows = self.generate_wfo_windows()
-        if not windows:
-            print("No se pudieron generar ventanas WFO. Se usa split único 80/20.")
-            self._reset_iteration_state()
-            result = self._run_training_loop()
-            with open(model_path, 'w') as f:
-                json.dump(result["best_model_data"], f, indent=4)
-            with open(score_path, 'w') as f:
-                json.dump({
-                    "mode": "single_split_fallback",
-                    "winner": result["info_score"]
-                }, f, indent=4)
-            print(f'tiempo total: {time.time() - self.comienzo:.2f} segundos')
-            return
+            if (
+                self.early_stopping_patience > 0
+                and self.index >= self.min_winning_iteration
+                and self.no_improve_iterations >= self.early_stopping_patience
+            ):
+                print(
+                    "Early stopping activado: "
+                    f"{self.no_improve_iterations} iteraciones elegibles sin mejora."
+                )
+                break
 
-        wfo_scores = []
-        wfo_drawdowns = []
-        latest_window_model_data = None
-        latest_window_metrics = {}
-        latest_test_end = None
-        wfo_windows_summary = []
+        self.finalize_best_candidate(last_model_data)
 
-        for i, window in enumerate(windows, start=1):
-            self.df_train = window["df_train"]
-            self.df_valid = window["df_valid"]
-            self.pip_size, self.point_size = get_pip_and_point_size(
-                self.principal_symbol,
-                self.df_train['open'] if 'open' in self.df_train.columns else self.df_valid['open']
-            )
-
-            print(
-                f"\n=== WFO Ventana {i}/{len(windows)} | "
-                f"Train: {window['train_start']} -> {window['train_end']} | "
-                f"Test: {window['test_start']} -> {window['test_end']} ==="
-            )
-
-            self._reset_iteration_state()
-            result = self._run_training_loop()
-
-            info = dict(result["info_score"]) if result["info_score"] else {}
-            info.update({
-                "window": i,
-                "train_start": str(window["train_start"]),
-                "train_end": str(window["train_end"]),
-                "test_start": str(window["test_start"]),
-                "test_end": str(window["test_end"]),
-                "best_score_window": result["best_score"],
-            })
-            wfo_scores.append(float(result["best_score"]))
-            wfo_drawdowns.append(float(info.get("max_drawdown", 0.0)))
-            wfo_windows_summary.append(info)
-
-            current_test_end = window["test_end"]
-            if latest_test_end is None or current_test_end > latest_test_end:
-                latest_test_end = current_test_end
-                latest_window_model_data = result["best_model_data"]
-                latest_window_metrics = info
-
-        if latest_window_model_data is None:
-            print("WFO sin mejor modelo válido. Se mantiene el modelo actual.")
-            print(f'tiempo total: {time.time() - self.comienzo:.2f} segundos')
-            return
-
-        mean_score = float(np.mean(wfo_scores)) if wfo_scores else 0.0
-        std_score = float(np.std(wfo_scores)) if wfo_scores else 0.0
-        min_score = float(np.min(wfo_scores)) if wfo_scores else 0.0
-        max_score = float(np.max(wfo_scores)) if wfo_scores else 0.0
-        robust_score = mean_score - std_score
-        mean_drawdown = float(np.mean(wfo_drawdowns)) if wfo_drawdowns else 0.0
-        max_drawdown = float(np.max(wfo_drawdowns)) if wfo_drawdowns else 0.0
-
-        with open(model_path, 'w') as f:
-            json.dump(latest_window_model_data, f, indent=4)
-        with open(score_path, 'w') as f:
+        torch_model_path = f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.pt'
+        torch.save(self.best_model_data, torch_model_path)
+        if self.ensemble_model_entries:
+            ensemble_model_path = f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/ensemble_{self.mercado}_{self.algorithm}.pt'
+            save_ensemble_model(self.ensemble_model_entries, ensemble_model_path)
+            self.info_score.setdefault("ensemble", {})["model_path"] = ensemble_model_path
+        with open(f'output/{self.principal_symbol}/data_for_neuronal/best_score/score_{self.mercado}_{self.algorithm}.json', 'w') as f:
             json.dump({
-                "mode": "wfo",
-                "selection_rule": "most_recent_test_end",
-                "wfo_config": {
-                    "train_years": self.wfo_train_years,
-                    "test_years": self.wfo_test_years,
-                    "step_years": self.wfo_step_years,
-                    "iterations_per_window": self.n_iterations,
-                    "windows": len(windows)
-                },
-                "robustness": {
-                    "mean_score": mean_score,
-                    "std_score": std_score,
-                    "robust_score": robust_score,
-                    "min_score": min_score,
-                    "max_score": max_score,
-                    "mean_max_drawdown": mean_drawdown,
-                    "max_drawdown": max_drawdown,
-                    "window_scores": wfo_scores
-                },
-                "latest_window": latest_window_metrics,
-                "windows_summary": wfo_windows_summary,
-                "winner": latest_window_metrics
-            }, f, indent=4)
+                "metrics": _sanitize_for_json(self.info_score)
+            }, f, indent=4, allow_nan=False)
         print(f'tiempo total: {time.time() - self.comienzo:.2f} segundos')
     
        
       
 if __name__ == "__main__":
     inn = time.time()
-    backtester = Backtester('AUDCAD', 'Asia', 'UP', date_end=None) 
+    backtester = Backtester('AUDCHF', 'Asia', 'DOWN', date_end=None) 
     backtester.run()
     print(f'segundos {time.time()-inn}')
     
