@@ -6,8 +6,10 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import operator
 
 import pandas as pd
+import numpy as np
 from src.db import query as db_query
 from src.routes import peticiones
+from src.signals.event_generator import add_event_features
 from src.utils.constructor_node import NodeGenerator
 from src.utils.common_functions import filtro_mercado, hora_en_mercado
 
@@ -55,6 +57,105 @@ def _pip_sizes(series, symbol):
     pip_size = 0.01 if 'JPY' in symbol.upper() else 0.0001
     point_size = (10 ** (-digits)) if digits > 0 else (pip_size / 10)
     return pip_size, point_size
+
+
+def max_losing_streak(values):
+    streak = 0
+    max_streak = 0
+    for value in values:
+        if value < 0:
+            streak += 1
+            max_streak = max(max_streak, streak)
+        else:
+            streak = 0
+    return max_streak
+
+
+def calculate_node_quality_stats(pips_values):
+    values = pd.Series(pips_values, dtype='float64').dropna().to_numpy()
+    if values.size == 0:
+        return None
+
+    expectancy = float(values.mean())
+    gross_profit = float(values[values > 0].sum())
+    gross_loss = float(abs(values[values < 0].sum()))
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else (2.0 if gross_profit > 0 else 0.0)
+    std_dev = float(values.std())
+    sharpe_like = float(expectancy / std_dev) if std_dev > 1e-8 else (2.0 if expectancy > 0 else 0.0)
+    equity_curve = values.cumsum()
+    running_max = np.maximum.accumulate(equity_curve)
+    drawdowns = equity_curve - running_max
+    max_drawdown = float(abs(drawdowns.min())) if drawdowns.size else 0.0
+    drawdown_ratio = max_drawdown / max(abs(float(values.sum())), 1.0)
+    quality_score = float(
+        (expectancy * 1.5) +
+        (min(profit_factor, 3.0) * 2.0) +
+        (min(sharpe_like, 2.5) * 1.5) -
+        (drawdown_ratio * 2.0) -
+        (max(max_losing_streak(values) - 3, 0) * 0.25)
+    )
+
+    return {
+        'expectancy': expectancy,
+        'profit_factor': float(profit_factor),
+        'sharpe_like': sharpe_like,
+        'drawdown_ratio': float(drawdown_ratio),
+        'quality_score': quality_score,
+    }
+
+
+def passes_quality_filters(stats_is, stats_os):
+    min_quality_score_is = float(config.get('MinNodeQualityScoreIS', 0.5))
+    min_quality_score_os = float(config.get('MinNodeQualityScoreOS', 0.25))
+    min_expectancy_is = float(config.get('MinNodeExpectancyIS', 0.0))
+    min_expectancy_os = float(config.get('MinNodeExpectancyOS', -0.25))
+    min_profit_factor_is = float(config.get('MinNodeProfitFactorIS', 1.02))
+    min_profit_factor_os = float(config.get('MinNodeProfitFactorOS', 0.98))
+    max_quality_gap = float(config.get('MaxNodeQualityGap', 2.0))
+
+    if stats_is is None or stats_os is None:
+        return False
+
+    if stats_is['quality_score'] < min_quality_score_is:
+        return False
+    if stats_os['quality_score'] < min_quality_score_os:
+        return False
+    if stats_is['expectancy'] < min_expectancy_is:
+        return False
+    if stats_os['expectancy'] < min_expectancy_os:
+        return False
+    if stats_is['profit_factor'] < min_profit_factor_is:
+        return False
+    if stats_os['profit_factor'] < min_profit_factor_os:
+        return False
+    if abs(stats_is['quality_score'] - stats_os['quality_score']) > max_quality_gap:
+        return False
+
+    return True
+
+
+def enrich_with_event_features(indicators_df, prices_df):
+    enriched = indicators_df.copy()
+    if 'time' in enriched.columns and not pd.api.types.is_datetime64_any_dtype(enriched['time']):
+        enriched['time'] = pd.to_datetime(enriched['time'])
+
+    price_frame = prices_df.copy()
+    if 'time' in price_frame.columns and not pd.api.types.is_datetime64_any_dtype(price_frame['time']):
+        price_frame['time'] = pd.to_datetime(price_frame['time'])
+
+    price_columns = ['open', 'high', 'low', 'close']
+    missing_columns = [column for column in price_columns if column not in enriched.columns]
+
+    if missing_columns:
+        merge_columns = ['time'] + [column for column in missing_columns if column in price_frame.columns]
+        if len(merge_columns) > 1:
+            enriched = enriched.merge(
+                price_frame[merge_columns].drop_duplicates(subset='time'),
+                on='time',
+                how='left'
+            )
+
+    return add_event_features(enriched)
 
 
 
@@ -115,13 +216,15 @@ def selecte_nodes(file: str, op_down, op_up, symbol, list_nodos, mercado):
     if 'time' in indicators_is.columns and not pd.api.types.is_datetime64_any_dtype(indicators_is['time']):
         indicators_is['time'] = pd.to_datetime(indicators_is['time'])
     
-    df_indicators_os = indicators_is.iloc[int(len(indicators_is)*0.8):].copy()  # Para no modificar el original
-    df_indicators_is = indicators_is.iloc[:int(len(indicators_is)*0.8)].copy()  # Para no modificar el original
-    
     df_bas = pd.read_csv(f'output/{symbol}/is_os/is.csv')
     # Convertir time a datetime ANTES de slice/copy
     if 'time' in df_bas.columns and not pd.api.types.is_datetime64_any_dtype(df_bas['time']):
         df_bas['time'] = pd.to_datetime(df_bas['time'])
+
+    indicators_is = enrich_with_event_features(indicators_is, df_bas)
+
+    df_indicators_os = indicators_is.iloc[int(len(indicators_is)*0.8):].copy()  # Para no modificar el original
+    df_indicators_is = indicators_is.iloc[:int(len(indicators_is)*0.8)].copy()  # Para no modificar el original
     
     df_os = df_bas.iloc[int(len(df_bas)*0.8):].copy()  # Para no modificar el original
     df_is = df_bas.iloc[:int(len(df_bas)*0.8)].copy()
@@ -233,6 +336,7 @@ def selecte_nodes(file: str, op_down, op_up, symbol, list_nodos, mercado):
         if (porcentaje_aciertos_os < config['MinSuccessRate'] or 
             porcentaje_aciertos_os > config['MaxSuccessRate']):
             continue
+        stats_os = calculate_node_quality_stats(beneficios_netos_os)
         
         progressive_os = total_os / total_filas_os
         
@@ -285,6 +389,9 @@ def selecte_nodes(file: str, op_down, op_up, symbol, list_nodos, mercado):
         if (porcentaje_aciertos_is < config['MinSuccessRate'] or 
             porcentaje_aciertos_is > config['MaxSuccessRate']):
             continue
+        stats_is = calculate_node_quality_stats(beneficios_netos_is)
+        if not passes_quality_filters(stats_is, stats_os):
+            continue
         
         progressive_is = total_is / total_filas_is
         progressiveVariation = abs(progressive_os - progressive_is)
@@ -323,17 +430,27 @@ def selecte_nodes(file: str, op_down, op_up, symbol, list_nodos, mercado):
             correct_percentage_os=float(porcentaje_aciertos_os),
             successful_operations_os=int(aciertos_os),
             total_operations_os=int(total_os),
+            stats_is=stats_is,
+            stats_os=stats_os,
             fechas=list_dates_is,
             veneficios=beneficios_netos_is.round(2).tolist(),
             fechas_os=merged_os['time'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist(),
             veneficios_os=beneficios_netos_os.round(2).tolist()
         )
-        print(f"Nodo insertado: {nodo['label']}  - Aciertos IS: {aciertos_is}/{total_is} ({porcentaje_aciertos_is:.2%}) - Aciertos OS: {aciertos_os}/{total_os} ({porcentaje_aciertos_os:.2%})")
+        print(
+            f"Nodo insertado: {nodo['label']} - Aciertos IS: {aciertos_is}/{total_is} ({porcentaje_aciertos_is:.2%}) "
+            f"- Aciertos OS: {aciertos_os}/{total_os} ({porcentaje_aciertos_os:.2%}) "
+            f"- score_is={stats_is['quality_score']:.3f} score_os={stats_os['quality_score']:.3f}"
+        )
         
            
 def procesar_archivo(file: str, symbol, mercado):
     try:
         df = pd.read_parquet(f"output/{symbol}/extrac/{file}")
+        df_bas = pd.read_csv(f'output/{symbol}/is_os/is.csv')
+        if 'time' in df_bas.columns and not pd.api.types.is_datetime64_any_dtype(df_bas['time']):
+            df_bas['time'] = pd.to_datetime(df_bas['time'])
+        df = enrich_with_event_features(df, df_bas)
         df_generator = df.iloc[:int(len(df)*0.2)].copy()  # Para no modificar el original
         node_generator = NodeGenerator(df_generator)
         operaciones_exitosas_UP = 0

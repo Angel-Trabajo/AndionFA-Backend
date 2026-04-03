@@ -15,6 +15,38 @@ if not logger.handlers:
 
 
 GENERAL_CONFIG_PATH = Path(__file__).resolve().parents[2] / 'config' / 'general_config.json'
+_SCHEMA_READY = False
+
+
+def ensure_nodes_metrics_columns() -> None:
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            ALTER TABLE nodes
+            ADD COLUMN IF NOT EXISTS expectancy FLOAT,
+            ADD COLUMN IF NOT EXISTS profit_factor FLOAT,
+            ADD COLUMN IF NOT EXISTS sharpe_like FLOAT,
+            ADD COLUMN IF NOT EXISTS drawdown_ratio FLOAT,
+            ADD COLUMN IF NOT EXISTS quality_score FLOAT,
+            ADD COLUMN IF NOT EXISTS max_losing_streak INT,
+            ADD COLUMN IF NOT EXISTS expectancy_os FLOAT,
+            ADD COLUMN IF NOT EXISTS profit_factor_os FLOAT,
+            ADD COLUMN IF NOT EXISTS sharpe_like_os FLOAT,
+            ADD COLUMN IF NOT EXISTS drawdown_ratio_os FLOAT,
+            ADD COLUMN IF NOT EXISTS quality_score_os FLOAT,
+            ADD COLUMN IF NOT EXISTS max_losing_streak_os INT
+            """
+        )
+        conn.commit()
+        _SCHEMA_READY = True
+    finally:
+        release_connection(conn)
 
 
 def _get_allowed_indicator_files() -> set[str] | None:
@@ -44,6 +76,8 @@ def insertar_nodo_con_registros(
     correct_percentage_os,
     successful_operations_os,
     total_operations_os,
+    stats_is=None,
+    stats_os=None,
     fechas=None,
     veneficios=None,
     fechas_os=None,
@@ -66,6 +100,11 @@ def insertar_nodo_con_registros(
             mercado
         )
 
+    ensure_nodes_metrics_columns()
+
+    stats_is = stats_is or {}
+    stats_os = stats_os or {}
+
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -86,9 +125,21 @@ def insertar_nodo_con_registros(
                 total_operations,
                 correct_percentage_os,
                 successful_operations_os,
-                total_operations_os
+                total_operations_os,
+                expectancy,
+                profit_factor,
+                sharpe_like,
+                drawdown_ratio,
+                quality_score,
+                max_losing_streak,
+                expectancy_os,
+                profit_factor_os,
+                sharpe_like_os,
+                drawdown_ratio_os,
+                quality_score_os,
+                max_losing_streak_os
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
 
             ON CONFLICT (
                 principal_symbol,
@@ -103,7 +154,19 @@ def insertar_nodo_con_registros(
                 total_operations = EXCLUDED.total_operations,
                 correct_percentage_os = EXCLUDED.correct_percentage_os,
                 successful_operations_os = EXCLUDED.successful_operations_os,
-                total_operations_os = EXCLUDED.total_operations_os
+                total_operations_os = EXCLUDED.total_operations_os,
+                expectancy = EXCLUDED.expectancy,
+                profit_factor = EXCLUDED.profit_factor,
+                sharpe_like = EXCLUDED.sharpe_like,
+                drawdown_ratio = EXCLUDED.drawdown_ratio,
+                quality_score = EXCLUDED.quality_score,
+                max_losing_streak = EXCLUDED.max_losing_streak,
+                expectancy_os = EXCLUDED.expectancy_os,
+                profit_factor_os = EXCLUDED.profit_factor_os,
+                sharpe_like_os = EXCLUDED.sharpe_like_os,
+                drawdown_ratio_os = EXCLUDED.drawdown_ratio_os,
+                quality_score_os = EXCLUDED.quality_score_os,
+                max_losing_streak_os = EXCLUDED.max_losing_streak_os
 
             RETURNING id
         """, (
@@ -118,7 +181,19 @@ def insertar_nodo_con_registros(
             total_operations,
             correct_percentage_os,
             successful_operations_os,
-            total_operations_os
+            total_operations_os,
+            stats_is.get('expectancy'),
+            stats_is.get('profit_factor'),
+            stats_is.get('sharpe_like'),
+            stats_is.get('drawdown_ratio'),
+            stats_is.get('quality_score'),
+            stats_is.get('max_losing_streak'),
+            stats_os.get('expectancy'),
+            stats_os.get('profit_factor'),
+            stats_os.get('sharpe_like'),
+            stats_os.get('drawdown_ratio'),
+            stats_os.get('quality_score'),
+            stats_os.get('max_losing_streak')
         ))
     except Exception:
         logger.exception(
@@ -438,6 +513,213 @@ def get_nodes_by_label(principal_symbol, symbol_cruce, mercado=None, label=None)
     if not resultados:
         return None
     return resultados
+
+
+def _build_nodes_filters(
+    principal_symbol=None,
+    symbol_cruce=None,
+    mercado=None,
+    label=None,
+    file_in_db=None,
+):
+    conditions = []
+    params = []
+
+    if principal_symbol is not None:
+        conditions.append("principal_symbol = %s")
+        params.append(principal_symbol)
+    if symbol_cruce is not None:
+        conditions.append("symbol_cruce = %s")
+        params.append(symbol_cruce)
+    if mercado is not None:
+        conditions.append("mercado = %s")
+        params.append(mercado)
+    if label is not None:
+        conditions.append("label = %s")
+        params.append(label)
+    if file_in_db is not None:
+        conditions.append("file_in_db = %s")
+        params.append(file_in_db)
+
+    where_clause = " AND ".join(conditions) if conditions else "TRUE"
+    return where_clause, params
+
+
+def get_ranked_nodes(
+    principal_symbol=None,
+    symbol_cruce=None,
+    mercado=None,
+    label=None,
+    file_in_db=None,
+    order_by="quality_score",
+    descending=True,
+    limit=50,
+    min_total_operations=None,
+):
+    ensure_nodes_metrics_columns()
+
+    allowed_order_columns = {
+        "quality_score",
+        "expectancy",
+        "profit_factor",
+        "sharpe_like",
+        "drawdown_ratio",
+        "correct_percentage",
+        "total_operations",
+        "quality_score_os",
+        "expectancy_os",
+        "profit_factor_os",
+        "sharpe_like_os",
+        "drawdown_ratio_os",
+        "correct_percentage_os",
+        "total_operations_os",
+    }
+    if order_by not in allowed_order_columns:
+        raise ValueError(f"Columna de orden no permitida: {order_by}")
+
+    where_clause, params = _build_nodes_filters(
+        principal_symbol=principal_symbol,
+        symbol_cruce=symbol_cruce,
+        mercado=mercado,
+        label=label,
+        file_in_db=file_in_db,
+    )
+
+    if min_total_operations is not None:
+        where_clause += " AND total_operations >= %s"
+        params.append(min_total_operations)
+
+    direction = "DESC" if descending else "ASC"
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            f"""
+            SELECT
+                id,
+                principal_symbol,
+                symbol_cruce,
+                label,
+                mercado,
+                file_in_db,
+                conditions,
+                correct_percentage,
+                successful_operations,
+                total_operations,
+                correct_percentage_os,
+                successful_operations_os,
+                total_operations_os,
+                expectancy,
+                profit_factor,
+                sharpe_like,
+                drawdown_ratio,
+                quality_score,
+                max_losing_streak,
+                expectancy_os,
+                profit_factor_os,
+                sharpe_like_os,
+                drawdown_ratio_os,
+                quality_score_os,
+                max_losing_streak_os
+            FROM nodes
+            WHERE {where_clause}
+            ORDER BY {order_by} {direction} NULLS LAST, total_operations DESC
+            LIMIT %s
+            """,
+            tuple(params + [limit])
+        )
+        rows = cursor.fetchall()
+    finally:
+        release_connection(conn)
+
+    columns = [
+        "id",
+        "principal_symbol",
+        "symbol_cruce",
+        "label",
+        "mercado",
+        "file_in_db",
+        "conditions",
+        "correct_percentage",
+        "successful_operations",
+        "total_operations",
+        "correct_percentage_os",
+        "successful_operations_os",
+        "total_operations_os",
+        "expectancy",
+        "profit_factor",
+        "sharpe_like",
+        "drawdown_ratio",
+        "quality_score",
+        "max_losing_streak",
+        "expectancy_os",
+        "profit_factor_os",
+        "sharpe_like_os",
+        "drawdown_ratio_os",
+        "quality_score_os",
+        "max_losing_streak_os",
+    ]
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def get_top_quality_nodes(
+    principal_symbol=None,
+    symbol_cruce=None,
+    mercado=None,
+    label=None,
+    limit=25,
+    min_total_operations=10,
+):
+    return get_ranked_nodes(
+        principal_symbol=principal_symbol,
+        symbol_cruce=symbol_cruce,
+        mercado=mercado,
+        label=label,
+        order_by="quality_score",
+        descending=True,
+        limit=limit,
+        min_total_operations=min_total_operations,
+    )
+
+
+def get_top_expectancy_nodes(
+    principal_symbol=None,
+    symbol_cruce=None,
+    mercado=None,
+    label=None,
+    limit=25,
+    min_total_operations=10,
+):
+    return get_ranked_nodes(
+        principal_symbol=principal_symbol,
+        symbol_cruce=symbol_cruce,
+        mercado=mercado,
+        label=label,
+        order_by="expectancy",
+        descending=True,
+        limit=limit,
+        min_total_operations=min_total_operations,
+    )
+
+
+def get_top_profit_factor_nodes(
+    principal_symbol=None,
+    symbol_cruce=None,
+    mercado=None,
+    label=None,
+    limit=25,
+    min_total_operations=10,
+):
+    return get_ranked_nodes(
+        principal_symbol=principal_symbol,
+        symbol_cruce=symbol_cruce,
+        mercado=mercado,
+        label=label,
+        order_by="profit_factor",
+        descending=True,
+        limit=limit,
+        min_total_operations=min_total_operations,
+    )
 
 
 # def get_node_by_id(name, id_node):

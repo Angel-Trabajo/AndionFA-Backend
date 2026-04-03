@@ -13,7 +13,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")
 from src.routes.peticiones import get_historical_data, get_timeframes
 from src.utils.indicadores_for_principal_script import generate_files
 from src.db.query import get_nodes_by_label
-from src.neuronal.entrenar import load_trained_model, predict_from_inputs, load_data, validate_embedding_vocab
+from src.neuronal.entrenar import EXTRA_FEATURE_COLUMNS, load_trained_model, predict_from_inputs, load_data, validate_embedding_vocab
+from src.signals.event_generator import add_event_features, has_entry_event
 from src.utils.common_functions import hora_en_mercado, crear_carpeta_si_no_existe
 
 
@@ -99,109 +100,40 @@ def get_pip_and_point_size(symbol, price_series):
 
 
 def should_backtest_strategy(metrics):
-    selection_reference = metrics.get("selection_reference") or metrics.get("selection", {})
-    reasons = selection_reference.get("raw_reasons") or []
-    reasons = set(reasons)
-    mild_reasons = {"low_trades", "low_winrate", "low_positive_month_ratio"}
-    severe_reasons = {
-        "high_drawdown_ratio",
-        "high_losing_streak",
-        "low_profit_factor",
-        "low_expectancy",
-        "low_positive_quarter_ratio",
-        "low_month_coverage",
-    }
-
-    if reasons & severe_reasons:
-        return False, f"rejected:{sorted(reasons & severe_reasons)}"
-
-    thresholds = selection_reference.get("thresholds", {})
-    strong_thresholds = thresholds.get("strong_candidate", {})
-    temporal = metrics.get("temporal_stats", {})
-    deployment_score = float(selection_reference.get("deployment_score", 0.0) or 0.0)
-    trades = int(metrics.get("cantidad_operaciones", 0) or 0)
-    profit_factor = float(metrics.get("profit_factor", 0.0) or 0.0)
-    expectancy = float(metrics.get("expectancy", 0.0) or 0.0)
-    winrate = float(metrics.get("winrate", 0.0) or 0.0)
-    n_months = int(temporal.get("n_months", 0) or 0)
-    positive_month_ratio = float(temporal.get("positive_month_ratio", 0.0) or 0.0)
-    positive_quarter_ratio = float(temporal.get("positive_quarter_ratio", 0.0) or 0.0)
-    max_drawdown_ratio = float(metrics.get("max_drawdown_ratio", 999.0) or 999.0)
-    losing_streak = int(metrics.get("mas_perdidas_seguidas", 999) or 999)
-
-    near_miss_min_trades = int(strong_thresholds.get("min_trades", 20) or 20)
-    near_miss_min_profit_factor = float(strong_thresholds.get("min_profit_factor", 1.35) or 1.35)
-    near_miss_min_expectancy = float(strong_thresholds.get("min_expectancy", 4.0) or 4.0)
-    near_miss_min_winrate = float(strong_thresholds.get("min_winrate", 0.40) or 0.40)
-    near_miss_max_drawdown_ratio = float(strong_thresholds.get("max_drawdown_ratio", 1.75) or 1.75)
-    near_miss_max_losing_streak = int(strong_thresholds.get("max_losing_streak", 8) or 8)
-    near_miss_min_positive_month_ratio = float(strong_thresholds.get("min_positive_month_ratio", 0.50) or 0.50)
-    near_miss_min_positive_quarter_ratio = float(strong_thresholds.get("min_positive_quarter_ratio", 0.50) or 0.50)
-    near_miss_min_deployment_score = float(strong_thresholds.get("min_deployment_score", 12.0) or 12.0)
-    near_miss_min_months = int(thresholds.get("min_months", 4) or 4)
-
-    strict_min_trades = int(thresholds.get("min_trades", 30) or 30)
-    strict_min_profit_factor = float(thresholds.get("min_profit_factor", 1.15) or 1.15)
-    strict_min_expectancy = float(thresholds.get("min_expectancy", 0.25) or 0.25)
-    strict_min_winrate = float(thresholds.get("min_winrate", 0.45) or 0.45)
-    strict_max_drawdown_ratio = float(thresholds.get("max_drawdown_ratio", 1.50) or 1.50)
-    strict_max_losing_streak = int(thresholds.get("max_losing_streak", 7) or 7)
-    strict_min_positive_month_ratio = float(thresholds.get("min_positive_month_ratio", 0.50) or 0.50)
-    strict_min_positive_quarter_ratio = float(thresholds.get("min_positive_quarter_ratio", 0.50) or 0.50)
-
-    approved = (
-        trades >= strict_min_trades and
-        profit_factor >= strict_min_profit_factor and
-        expectancy >= strict_min_expectancy and
-        winrate >= strict_min_winrate and
-        n_months >= near_miss_min_months and
-        positive_month_ratio >= strict_min_positive_month_ratio and
-        positive_quarter_ratio >= strict_min_positive_quarter_ratio and
-        max_drawdown_ratio <= strict_max_drawdown_ratio and
-        losing_streak <= strict_max_losing_streak
+    winrate = metrics.get("winrate", 0)
+    profit_factor = metrics.get("profit_factor", 0)
+    expectancy = metrics.get("expectancy", 0)
+    list_pips_monthly = list(metrics.get("temporal_stats", {}).get("monthly_pips",{}).values())
+    
+    def score(fila):
+        fila = np.array(fila)
+        
+        suma = np.sum(fila)
+        volatilidad = np.std(fila)
+        maximo = np.max(fila)
+        minimo = np.min(fila)
+        
+        return (
+            0.4 * suma
+            - 0.3 * volatilidad
+            + 0.2 * maximo
+            + 0.1 * minimo
+        )
+        
+    def probabilidad(score):
+        import math
+        return 1 / (1 + math.exp(-score / 100))
+    s = score(list_pips_monthly)
+    prob = probabilidad(s)  
+    
+    decision =(
+        winrate >= 0.45 and
+        profit_factor >= 1.5 and
+        expectancy >= 10 and
+        prob >= 0.77
     )
-
-    if approved:
-        return True, "approved"
-
-    allowed_strong_reasons = set(strong_thresholds.get("allowed_reasons", list(mild_reasons)))
-    strong_candidate = (
-        len(reasons) == 1 and
-        reasons.issubset(allowed_strong_reasons) and
-        n_months >= near_miss_min_months and
-        trades >= near_miss_min_trades and
-        profit_factor >= near_miss_min_profit_factor and
-        expectancy >= near_miss_min_expectancy and
-        winrate >= near_miss_min_winrate and
-        positive_month_ratio >= near_miss_min_positive_month_ratio and
-        positive_quarter_ratio >= near_miss_min_positive_quarter_ratio and
-        max_drawdown_ratio <= near_miss_max_drawdown_ratio and
-        losing_streak <= near_miss_max_losing_streak and
-        deployment_score >= near_miss_min_deployment_score
-    )
-
-    if strong_candidate:
-        return True, "strong_candidate"
-
-    near_miss = (
-        reasons.issubset(mild_reasons) and
-        n_months >= near_miss_min_months and
-        trades >= near_miss_min_trades and
-        profit_factor >= near_miss_min_profit_factor and
-        expectancy >= near_miss_min_expectancy and
-        winrate >= near_miss_min_winrate and
-        positive_month_ratio >= near_miss_min_positive_month_ratio and
-        positive_quarter_ratio >= near_miss_min_positive_quarter_ratio and
-        max_drawdown_ratio <= near_miss_max_drawdown_ratio and
-        losing_streak <= near_miss_max_losing_streak and
-        deployment_score >= near_miss_min_deployment_score
-    )
-
-    if near_miss:
-        return True, f"near_miss:{sorted(reasons)}"
-
-    return False, f"rejected:{sorted(reasons)}"
-
+    
+    return decision
 
 class Backtest:
     
@@ -246,6 +178,9 @@ class Backtest:
         self.min_model_holding = 15
         self.close_confirmation_bars = 2
         self.close_threshold_floor = 0.60
+        self.min_open_symbol_confirmations = int(
+            self.general_config.get('MinOpenSymbolConfirmations', 4)
+        )
         
         self.setup_operators_and_mappings()
         self.load_nodes()
@@ -271,24 +206,19 @@ class Backtest:
         df['vol_20'] = df['close'].rolling(20).std()
         df['zscore_20'] = (df['close'] - df['ma_20']) / (df['vol_20'] + 1e-8)
         df['momentum_ratio'] = df['ret_3'] / (df['vol_10'] + 1e-8)
+        df = add_event_features(df)
         return df.dropna().reset_index(drop=True)
 
 
     def get_market_features(self, row):
         return np.array([
-            float(getattr(row, 'ret_1')),
-            float(getattr(row, 'range_1')),
-            float(getattr(row, 'trend')),
-            float(getattr(row, 'vol')),
-            float(getattr(row, 'ret_3')),
-            float(getattr(row, 'ret_10')),
-            float(getattr(row, 'trend_10')),
-            float(getattr(row, 'trend_20')),
-            float(getattr(row, 'vol_10')),
-            float(getattr(row, 'vol_20')),
-            float(getattr(row, 'zscore_20')),
-            float(getattr(row, 'momentum_ratio')),
+            float(getattr(row, column, 0.0))
+            for column in EXTRA_FEATURE_COLUMNS
         ], dtype=np.float32)
+
+
+    def is_entry_event_active(self, row):
+        return has_entry_event(row, self.algorithm)
 
 
     def get_trade_risk_limits(self, row):
@@ -308,11 +238,19 @@ class Backtest:
             "!=": operator.ne
         }
 
-        with open(f'output/{self.principal_symbol}/data_for_neuronal/maping/maping_open_{self.mercado}_{self.algorithm}.json', 'r') as file:
-            self.maping_open = json.load(file)
+        open_mapping_path = f'output/{self.principal_symbol}/data_for_neuronal/maping/maping_open_{self.mercado}_{self.algorithm}.json'
+        close_mapping_path = f'output/{self.principal_symbol}/data_for_neuronal/maping/maping_close_{self.mercado}_{self.algorithm}.json'
 
-        with open(f'output/{self.principal_symbol}/data_for_neuronal/maping/maping_close_{self.mercado}_{self.algorithm}.json', 'r') as file:
-            self.maping_close = json.load(file)  
+        self.maping_open = {}
+        self.maping_close = {}
+
+        if os.path.exists(open_mapping_path):
+            with open(open_mapping_path, 'r') as file:
+                self.maping_open = json.load(file)
+
+        if os.path.exists(close_mapping_path):
+            with open(close_mapping_path, 'r') as file:
+                self.maping_close = json.load(file)
 
         score_path = f'output/{self.principal_symbol}/data_for_neuronal/best_score/score_{self.mercado}_{self.algorithm}.json'
         if os.path.exists(score_path):
@@ -331,8 +269,11 @@ class Backtest:
             self.strategy_selection = {}
             self.ensemble_model_path = None
             self.close_threshold = self.close_threshold_floor
+      
         
     def parsear_nodos(self, nodos):
+        if not nodos:
+            return []
         return [
             {
                 "key": n[0],
@@ -349,11 +290,11 @@ class Backtest:
 
         for i, symbol in enumerate(self.list_symbols):
             self.dict_nodos[symbol] = self.parsear_nodos(
-                get_nodes_by_label(self.principal_symbol, symbol, self.mercado, self.algorithm)
+                get_nodes_by_label(self.principal_symbol, symbol, self.mercado, self.algorithm) or []
             )
 
         self.nodos_close = self.parsear_nodos(
-            get_nodes_by_label(self.principal_symbol, self.principal_symbol, mercado=None, label=self.other_algorithm)
+            get_nodes_by_label(self.principal_symbol, self.principal_symbol, mercado=None, label=self.other_algorithm) or []
         )
 
     
@@ -391,6 +332,38 @@ class Backtest:
             if v is None or not self.operadores[op](v, valor):
                 return False
         return True  
+
+
+    def resolve_entry_open_nodes(self, time_actual_np):
+        matched_symbols = 0
+        open_nodes = []
+
+        for symbol in self.list_symbols:
+            nodo_open_list = self.dict_nodos[symbol]
+
+            for nodo in nodo_open_list:
+                df_struct = self.indicators[f'{self.principal_symbol}_{symbol}_{nodo["file"].split("_")[0]}']
+                pos = df_struct["index_values"].searchsorted(time_actual_np)
+
+                if pos == 0:
+                    continue
+
+                if self.cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
+                    matched_symbols += 1
+
+                    if symbol == self.principal_symbol:
+                        nodo_open = self.maping_open.get(nodo["key"])
+                        if nodo_open is not None:
+                            open_nodes.append(nodo_open)
+                    break
+
+        if matched_symbols < self.min_open_symbol_confirmations:
+            return []
+
+        if not open_nodes:
+            return []
+
+        return list(dict.fromkeys(open_nodes))
     
     
     def calculate_trade_pips(self, open_price_open, open_price_close, spread_open):
@@ -470,7 +443,9 @@ class Backtest:
 
                         if self.cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
 
-                            nodo_close = self.maping_close[nodo["key"]]
+                            nodo_close = self.maping_close.get(nodo["key"])
+                            if nodo_close is None:
+                                continue
                             prob = predict_from_inputs(nn, entry_red_open, nodo_close, hour, market_features)
                             if prob > self.close_threshold:
                                 model_close_signal = True
@@ -504,37 +479,18 @@ class Backtest:
 
                 cierre = 0
 
-                for symbol in self.list_symbols:
+                if not self.is_entry_event_active(row):
+                    continue
 
-                    cumple_alguno = False
-                    nodo_open_list = self.dict_nodos[symbol]
-
-                    for nodo in nodo_open_list:
-
-                        df_struct = self.indicators[f'{self.principal_symbol}_{symbol}_{nodo["file"].split("_")[0]}']
-                        pos = df_struct["index_values"].searchsorted(time_actual_np)
-                        
-                        if pos == 0:
-                            continue
-
-                        if self.cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
-
-                            cumple_alguno = True
-
-                            if symbol == self.list_symbols[-1]:
-                                open_price_open = open_price
-                                spread_open = getattr(row, 'spread', 0.0)
-                                current_stop_loss, current_take_profit = self.get_trade_risk_limits(row)
-                                is_open = True
-                                time_comienzo = time_actual
-                                model_close_streak = 0
-                                nodo_open = self.maping_open[nodo["key"]]
-                                entry_red_open = nodo_open
-
-                            break
-
-                    if not cumple_alguno:
-                        break
+                open_nodes = self.resolve_entry_open_nodes(time_actual_np)
+                if open_nodes:
+                    open_price_open = open_price
+                    spread_open = getattr(row, 'spread', 0.0)
+                    current_stop_loss, current_take_profit = self.get_trade_risk_limits(row)
+                    is_open = True
+                    time_comienzo = time_actual
+                    model_close_streak = 0
+                    entry_red_open = open_nodes[0]
 
         return self.results
 
@@ -607,24 +563,20 @@ if __name__ == "__main__":
     list_algorithms = ['UP', 'DOWN']
     list_principal_symbols = config['list_principal_symbols']
     date_start = "2023-01-01"
-    date_end = "2024-05-01"
+    date_end = "2023-06-01"
     for principal_symbol in list_principal_symbols:
         for mercado in list_mercado:
             for algorithm in list_algorithms:
                 with open(f'output/{principal_symbol}/data_for_neuronal/best_score/score_{mercado}_{algorithm}.json', 'r') as file:
                     best_score_data = json.load(file)
                 metrics = best_score_data.get("metrics", {})
-                should_run, reason = should_backtest_strategy(metrics)
-                if not should_run:
-                    print(
-                        f"Saltando backtest para {principal_symbol} - {mercado} - {algorithm} "
-                        f"por filtros operativos: {reason}"
-                    )
-                    continue
-                print(
-                    f"Ejecutando backtest para {principal_symbol} - {mercado} - {algorithm} "
-                    f"con criterio: {reason}"
-                )
+                should_run = should_backtest_strategy(metrics)
+                # if not should_run:
+                #     print(
+                #         f"Saltando backtest para {principal_symbol} - {mercado} - {algorithm} "
+                #     )
+                #     continue
+              
                 backtest = Backtest(principal_symbol, mercado, algorithm, date_start, date_end)
                 backtest.run()
     # backtest = Backtest('AUDCHF', 'Asia', 'UP', date_start, date_end)

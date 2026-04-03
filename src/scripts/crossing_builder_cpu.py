@@ -15,6 +15,7 @@ import numpy as np
 
 from src.routes import peticiones
 from src.db import query as db_query
+from src.signals.event_generator import add_event_features
 from src.utils.indicadores_for_crossing import extract_indicadores
 from src.utils.constructor_node import NodeGenerator
 from src.utils.extrat_data_for_crossing import extract_data_crossing, select_symbols_correl
@@ -92,6 +93,109 @@ def _pip_sizes(series, symbol):
     return pip_size, point_size
 
 
+def max_losing_streak(values):
+    streak = 0
+    max_streak = 0
+    for value in values:
+        if value < 0:
+            streak += 1
+            max_streak = max(max_streak, streak)
+        else:
+            streak = 0
+    return max_streak
+
+
+def calculate_node_quality_stats(pips_list):
+    values = np.asarray(pips_list, dtype=np.float64)
+    if values.size == 0:
+        return None
+
+    expectancy = float(np.mean(values))
+    gross_profit = float(values[values > 0].sum())
+    gross_loss = float(abs(values[values < 0].sum()))
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else (2.0 if gross_profit > 0 else 0.0)
+    std_dev = float(np.std(values))
+    sharpe_like = float(expectancy / std_dev) if std_dev > 1e-8 else (2.0 if expectancy > 0 else 0.0)
+    equity_curve = np.cumsum(values)
+    running_max = np.maximum.accumulate(equity_curve) if values.size else np.array([], dtype=np.float64)
+    drawdowns = equity_curve - running_max if values.size else np.array([], dtype=np.float64)
+    max_drawdown = float(abs(drawdowns.min())) if drawdowns.size else 0.0
+    drawdown_ratio = max_drawdown / max(abs(float(values.sum())), 1.0)
+    loss_streak = max_losing_streak(values)
+    quality_score = float(
+        (expectancy * 1.5) +
+        (min(profit_factor, 3.0) * 2.0) +
+        (min(sharpe_like, 2.5) * 1.5) -
+        (drawdown_ratio * 2.0) -
+        (max(loss_streak - 3, 0) * 0.25)
+    )
+
+    return {
+        'expectancy': expectancy,
+        'profit_factor': float(profit_factor),
+        'sharpe_like': sharpe_like,
+        'max_drawdown': max_drawdown,
+        'drawdown_ratio': float(drawdown_ratio),
+        'max_losing_streak': int(loss_streak),
+        'quality_score': quality_score,
+    }
+
+
+def passes_quality_filters(stats_is, stats_os, config):
+    general = config.get('general', {})
+    min_quality_score_is = float(general.get('MinNodeQualityScoreIS', 0.5))
+    min_quality_score_os = float(general.get('MinNodeQualityScoreOS', 0.25))
+    min_expectancy_is = float(general.get('MinNodeExpectancyIS', 0.0))
+    min_expectancy_os = float(general.get('MinNodeExpectancyOS', -0.25))
+    min_profit_factor_is = float(general.get('MinNodeProfitFactorIS', 1.02))
+    min_profit_factor_os = float(general.get('MinNodeProfitFactorOS', 0.98))
+    max_quality_gap = float(general.get('MaxNodeQualityGap', 2.0))
+
+    if stats_is is None or stats_os is None:
+        return False
+
+    if stats_is['quality_score'] < min_quality_score_is:
+        return False
+    if stats_os['quality_score'] < min_quality_score_os:
+        return False
+    if stats_is['expectancy'] < min_expectancy_is:
+        return False
+    if stats_os['expectancy'] < min_expectancy_os:
+        return False
+    if stats_is['profit_factor'] < min_profit_factor_is:
+        return False
+    if stats_os['profit_factor'] < min_profit_factor_os:
+        return False
+    if abs(stats_is['quality_score'] - stats_os['quality_score']) > max_quality_gap:
+        return False
+
+    return True
+
+
+def enrich_with_event_features(indicators_df, prices_df):
+    enriched = indicators_df.copy()
+    if 'time' in enriched.columns and not pd.api.types.is_datetime64_any_dtype(enriched['time']):
+        enriched['time'] = pd.to_datetime(enriched['time'])
+
+    price_frame = prices_df.copy()
+    if 'time' in price_frame.columns and not pd.api.types.is_datetime64_any_dtype(price_frame['time']):
+        price_frame['time'] = pd.to_datetime(price_frame['time'])
+
+    price_columns = ['open', 'high', 'low', 'close']
+    missing_columns = [column for column in price_columns if column not in enriched.columns]
+
+    if missing_columns:
+        merge_columns = ['time'] + [column for column in missing_columns if column in price_frame.columns]
+        if len(merge_columns) > 1:
+            enriched = enriched.merge(
+                price_frame[merge_columns].drop_duplicates(subset='time'),
+                on='time',
+                how='left'
+            )
+
+    return add_event_features(enriched)
+
+
 def calcular_descuento(N0, Nf, k):
     """
     Calcula el porcentaje de descuento por iteración.
@@ -140,7 +244,11 @@ def dataframe_to_matrix(df, condition_cols):
     """
     Convierte DataFrame a matriz numérica ordenada por columnas usadas en condiciones
     """
-    data = df[condition_cols].to_numpy(dtype=np.float64)
+    working_df = df.copy()
+    missing_columns = [column for column in condition_cols if column not in working_df.columns]
+    for column in missing_columns:
+        working_df[column] = 0.0
+    data = working_df[condition_cols].to_numpy(dtype=np.float64)
     return data
 
 
@@ -163,7 +271,8 @@ def selecte_nodes(
     principal_symbol = config['principal_symbol']
     list_symbol = config['symbol']['list_symbol']
     ini = tim.time()
-    cant_nodos = 1000 
+    cant_nodos = int(config['general'].get('cant_nodos', 500))
+    cant_nodos = max(50, cant_nodos)
     list_nodos = node_generator.generar_nodos(cant_nodos)
     print(f"{cant_nodos} Nodos generados en {tim.time() - ini:.4f} segundos")
     
@@ -190,15 +299,16 @@ def selecte_nodes(
     # Convertir time a datetime ANTES de slice/copy
     if 'time' in indicators_is.columns and not pd.api.types.is_datetime64_any_dtype(indicators_is['time']):
         indicators_is['time'] = pd.to_datetime(indicators_is['time'])
-    
-    df_indicators_os = indicators_is.iloc[int(len(indicators_is)*0.8):].copy()  # Para no modificar el original
-    df_indicators_is = indicators_is.iloc[:int(len(indicators_is)*0.8)].copy()  # Para no modificar el original
-        
      
     df_bas = load_csv_cached(f'output/{principal_symbol}/is_os/is.csv')
     # Convertir time a datetime ANTES de slice/copy
     if 'time' in df_bas.columns and not pd.api.types.is_datetime64_any_dtype(df_bas['time']):
         df_bas['time'] = pd.to_datetime(df_bas['time'])
+
+    indicators_is = enrich_with_event_features(indicators_is, df_bas)
+
+    df_indicators_os = indicators_is.iloc[int(len(indicators_is)*0.8):].copy()  # Para no modificar el original
+    df_indicators_is = indicators_is.iloc[:int(len(indicators_is)*0.8)].copy()  # Para no modificar el original
     
     df_os = df_bas.iloc[int(len(df_bas)*0.8):].copy()  # Para no modificar el original
     df_is = df_bas.iloc[:int(len(df_bas)*0.8)].copy()  # Para no modificar el original
@@ -339,6 +449,7 @@ def selecte_nodes(
         porcentaje_os = (aciertos / total)
         if not (prev_os + (porcent_aumento_os - 0.02) <= porcentaje_os <= prev_os + (porcent_aumento_os + 0.02)):
             continue        
+        stats_os = calculate_node_quality_stats(list_beneficio_os)
         progressive_os = total/len(df_indicators_os)
        
         #--------------------------------------------------------------------------------
@@ -401,6 +512,9 @@ def selecte_nodes(
        
         if not (prev_is + (porcent_aumento_is - 0.015) <= porcentaje_aciertos_is <= prev_is + (porcent_aumento_is + 0.015)):
             continue
+        stats_is = calculate_node_quality_stats(list_beneficio_is)
+        if not passes_quality_filters(stats_is, stats_os, config):
+            continue
         
         progressive_is = total_is/len(df_indicators_is) 
         progressiveVariation = abs(progressive_os - progressive_is)
@@ -434,17 +548,27 @@ def selecte_nodes(
             correct_percentage_os=porcentaje_os,
             successful_operations_os=aciertos,
             total_operations_os=total,
+            stats_is=stats_is,
+            stats_os=stats_os,
             fechas=list_dates_is,
             veneficios=list_beneficio_is,
             fechas_os=list_dates_os,
             veneficios_os=list_beneficio_os,    
         )
-        print(f"Nodo insertado: symbol={symbol} action={action} mercado={mercado} porcentaje_is={porcentaje_aciertos_is:.4f} porcentaje_os={porcentaje_os:.4f} total_is={total_is} total_os={total}")
+        print(
+            f"Nodo insertado: symbol={symbol} action={action} mercado={mercado} "
+            f"porcentaje_is={porcentaje_aciertos_is:.4f} porcentaje_os={porcentaje_os:.4f} "
+            f"score_is={stats_is['quality_score']:.3f} score_os={stats_os['quality_score']:.3f} "
+            f"pf_is={stats_is['profit_factor']:.2f} pf_os={stats_os['profit_factor']:.2f} "
+            f"total_is={total_is} total_os={total}"
+        )
 
 
 def procesar_archivo(file: str, symbol, action, cont, prev_os, prev_is, porcent_aumento_os, porcent_aumento_is, NumMaxOperations, config, mercado):
     principal_symbol = config['principal_symbol']
     df = pd.read_parquet(f'output/{principal_symbol}/crossing/{symbol}/extrac/{file}')
+    df_bas = load_csv_cached(f'output/{principal_symbol}/is_os/is.csv')
+    df = enrich_with_event_features(df, df_bas)
     df_generator = df.iloc[:int(len(df)*0.2)].copy()  # Para no modificar el original
     node_generator = NodeGenerator(df_generator)
     operaciones_exitosas = 0

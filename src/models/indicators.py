@@ -16,4 +16,5 @@ class ConfigRequest(BaseModel):
     MinSuccessRate: float
     MaxSuccessRate: float
     ProgressiveVariation: float
+    MinOpenSymbolConfirmations: int = 4
     

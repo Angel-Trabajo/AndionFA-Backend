@@ -24,15 +24,19 @@ from src.db.query import get_nodes_by_label
 from src.utils.indicadores_for_crossing import extract_indicadores
 from src.utils.common_functions import get_previous_4_6, hora_en_mercado
 from src.neuronal.entrenar import (
+    EXTRA_FEATURE_COLUMNS,
+    MIN_TRAINING_SAMPLES,
     load_trained_model,
     predict_from_inputs,
     BinaryNN,
+    has_minimum_training_data,
     load_data,
     save_trained_model,
     save_ensemble_model,
     get_embedding_vocab_sizes,
     validate_embedding_vocab,
 )
+from src.signals.event_generator import EVENT_FEATURE_COLUMNS, add_event_features, has_entry_event
 
 
 def _max_decimals(series, sample_size=1000):
@@ -103,6 +107,7 @@ class Backtester:
         self.close_threshold_history_window = 5
         self.threshold_validation_split_ratio = 0.50
         self.validation_window_months = 6
+        self.min_open_symbol_confirmations = 4
         self.train_b_fraction = 0.30
         self.threshold_min_calibration_trades = 15
         self.threshold_min_selected_trades = 10
@@ -123,7 +128,7 @@ class Backtester:
         self.label_min_context_samples = 25
         self.label_volatility_floor_pips = 5.0
         self.min_winning_iteration = 8
-        self.max_iterations = 25
+        self.max_iterations = 15
         self.early_stopping_patience = 8
         self.no_improve_iterations = 0
         self.min_trades_score = 30
@@ -153,6 +158,7 @@ class Backtester:
             "low_positive_month_ratio",
         }
         self.train_b_label_blocks = 3
+        self.min_training_samples = MIN_TRAINING_SAMPLES
         self.data_end = date_end
         self.principal_symbol = principal_symbol
         self.mercado = mercado
@@ -192,6 +198,9 @@ class Backtester:
         self.list_symbols.insert(0, self.principal_symbol)
         self.general_config = general_config
         self.config_symbol = config_symbol
+        self.min_open_symbol_confirmations = int(
+            self.general_config.get('MinOpenSymbolConfirmations', self.min_open_symbol_confirmations)
+        )
         data_start_is, data_end_is = get_previous_4_6(
             self.general_config['dateStart'], 
             self.general_config['dateEnd']
@@ -310,40 +319,25 @@ class Backtester:
         df['vol_20'] = df['close'].rolling(20).std()
         df['zscore_20'] = (df['close'] - df['ma_20']) / (df['vol_20'] + 1e-8)
         df['momentum_ratio'] = df['ret_3'] / (df['vol_10'] + 1e-8)
+        df = add_event_features(df)
         return df.dropna()
 
 
     def get_market_features(self, row):
         if isinstance(row, pd.Series):
             return np.array([
-                float(row['ret_1']),
-                float(row['range_1']),
-                float(row['trend']),
-                float(row['vol']),
-                float(row['ret_3']),
-                float(row['ret_10']),
-                float(row['trend_10']),
-                float(row['trend_20']),
-                float(row['vol_10']),
-                float(row['vol_20']),
-                float(row['zscore_20']),
-                float(row['momentum_ratio']),
+                float(row.get(column, 0.0))
+                for column in EXTRA_FEATURE_COLUMNS
             ], dtype=np.float32)
 
         return np.array([
-            float(getattr(row, 'ret_1')),
-            float(getattr(row, 'range_1')),
-            float(getattr(row, 'trend')),
-            float(getattr(row, 'vol')),
-            float(getattr(row, 'ret_3')),
-            float(getattr(row, 'ret_10')),
-            float(getattr(row, 'trend_10')),
-            float(getattr(row, 'trend_20')),
-            float(getattr(row, 'vol_10')),
-            float(getattr(row, 'vol_20')),
-            float(getattr(row, 'zscore_20')),
-            float(getattr(row, 'momentum_ratio')),
+            float(getattr(row, column, 0.0))
+            for column in EXTRA_FEATURE_COLUMNS
         ], dtype=np.float32)
+
+
+    def is_entry_event_active(self, row):
+        return has_entry_event(row, self.algorithm)
 
 
     def get_trade_risk_limits(self, row):
@@ -367,6 +361,8 @@ class Backtester:
 
 
     def parsear_nodos(self, nodos):
+        if not nodos:
+            return []
         return [
             {
                 "key": n[0],
@@ -401,11 +397,19 @@ class Backtester:
             "!=": operator.ne
         }
 
-        with open(f'output/{self.principal_symbol}/data_for_neuronal/maping/maping_open_{self.mercado}_{self.algorithm}.json', 'r') as file:
-            self.maping_open = json.load(file)
+        open_mapping_path = f'output/{self.principal_symbol}/data_for_neuronal/maping/maping_open_{self.mercado}_{self.algorithm}.json'
+        close_mapping_path = f'output/{self.principal_symbol}/data_for_neuronal/maping/maping_close_{self.mercado}_{self.algorithm}.json'
 
-        with open(f'output/{self.principal_symbol}/data_for_neuronal/maping/maping_close_{self.mercado}_{self.algorithm}.json', 'r') as file:
-            self.maping_close = json.load(file)  
+        self.maping_open = {}
+        self.maping_close = {}
+
+        if os.path.exists(open_mapping_path):
+            with open(open_mapping_path, 'r') as file:
+                self.maping_open = json.load(file)
+
+        if os.path.exists(close_mapping_path):
+            with open(close_mapping_path, 'r') as file:
+                self.maping_close = json.load(file)
     
   
     def load_nodes(self):
@@ -414,11 +418,11 @@ class Backtester:
 
         for i, symbol in enumerate(self.list_symbols):
             self.dict_nodos[symbol] = self.parsear_nodos(
-                get_nodes_by_label(self.principal_symbol, symbol, self.mercado, self.algorithm)
+                get_nodes_by_label(self.principal_symbol, symbol, self.mercado, self.algorithm) or []
             )
 
         self.nodos_close = self.parsear_nodos(
-            get_nodes_by_label(self.principal_symbol, self.principal_symbol, mercado=None, label=self.other_algorithm)
+            get_nodes_by_label(self.principal_symbol, self.principal_symbol, mercado=None, label=self.other_algorithm) or []
         )  
        
 
@@ -533,7 +537,9 @@ class Backtester:
                         continue
 
                     if self.cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
-                        matching_close_nodes.append(self.maping_close[nodo["key"]])
+                        mapped_close = self.maping_close.get(nodo["key"])
+                        if mapped_close is not None:
+                            matching_close_nodes.append(mapped_close)
 
             if matching_close_nodes:
                 for entry_red_open in entry_red_opens:
@@ -567,7 +573,6 @@ class Backtester:
 
         while row_pos < total_rows:
             row = df.iloc[row_pos]
-            entry_red_opens = []
             time_actual = df.index[row_pos]
             time_actual_np = np.datetime64(time_actual)
 
@@ -575,29 +580,13 @@ class Backtester:
                 row_pos += 1
                 continue
 
+            if not self.is_entry_event_active(row):
+                row_pos += 1
+                continue
+
             open_price = row.open
 
-            for symbol in self.list_symbols:
-                cumple_alguno = False
-                nodo_open_list = self.dict_nodos[symbol]
-
-                for nodo in nodo_open_list:
-                    df_struct = self.COMBINED[("open", symbol, nodo["file"])]
-                    pos = df_struct["index_values"].searchsorted(time_actual_np)
-                    if pos == 0:
-                        continue
-
-                    if self.cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
-                        cumple_alguno = True
-
-                        if symbol == self.list_symbols[-1]:
-                            nodo_open = self.maping_open[nodo["key"]]
-                            entry_red_opens.append(nodo_open)
-                        else:
-                            break
-
-                if not cumple_alguno:
-                    break
+            entry_red_opens = self.resolve_entry_open_nodes(time_actual_np)
 
             if not entry_red_opens:
                 row_pos += 1
@@ -761,6 +750,62 @@ class Backtester:
         return self.df_valid
 
 
+    def resolve_entry_open_nodes(self, time_actual_np):
+        matched_symbols = 0
+        open_nodes = []
+
+        for symbol in self.list_symbols:
+            nodo_open_list = self.dict_nodos[symbol]
+
+            for nodo in nodo_open_list:
+                df_struct = self.COMBINED[("open", symbol, nodo["file"])]
+                pos = df_struct["index_values"].searchsorted(time_actual_np)
+
+                if pos == 0:
+                    continue
+
+                if self.cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
+                    matched_symbols += 1
+
+                    if symbol == self.principal_symbol:
+                        nodo_open = self.maping_open.get(nodo["key"])
+                        if nodo_open is not None:
+                            open_nodes.append(nodo_open)
+                    break
+
+        if matched_symbols < self.min_open_symbol_confirmations:
+            return []
+
+        if not open_nodes:
+            return []
+
+        return list(dict.fromkeys(open_nodes))
+
+
+    def select_label_reference_values(self, hour_key, context_values, global_values):
+        hour_values = context_values.get(hour_key, [])
+        hour_unique = len({round(float(value), 8) for value in hour_values})
+        global_unique = len({round(float(value), 8) for value in global_values})
+
+        if len(hour_values) >= self.label_min_context_samples and hour_unique >= 2:
+            return hour_values
+        if len(global_values) >= 2 and global_unique >= 2:
+            return global_values
+        if len(hour_values) >= 2 and hour_unique >= 2:
+            return hour_values
+        return []
+
+
+    def get_effective_label_percentile(self, candidate_count):
+        base_percentile = float(self.label_percentile_threshold)
+        if candidate_count <= 0:
+            return base_percentile
+
+        target_keep_ratio = min(1.0, (self.min_training_samples / max(candidate_count, 1)) * 1.05)
+        adaptive_percentile = 100.0 - (50.0 * target_keep_ratio)
+        return float(min(base_percentile, max(50.0, adaptive_percentile)))
+
+
     def build_dataset_from_df(self, df, dict_pips_best, allow_empty=False):
 
         candidate_samples = []
@@ -769,31 +814,11 @@ class Backtester:
             time_actual = row.Index
             time_actual_np = np.datetime64(time_actual)
             hour = format(time_actual.hour, "05b")
-            open_nodes = []
 
-            for symbol in self.list_symbols:
-                cumple_alguno = False
-                nodo_open_list = self.dict_nodos[symbol]
+            if not self.is_entry_event_active(row):
+                continue
 
-                for nodo in nodo_open_list:
-                    df_struct = self.COMBINED[("open", symbol, nodo["file"])]
-                    pos = df_struct["index_values"].searchsorted(time_actual_np)
-
-                    if pos == 0:
-                        continue
-
-                    if self.cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
-                        cumple_alguno = True
-
-                        if symbol == self.list_symbols[-1]:
-                            nodo_open = self.maping_open[nodo["key"]]
-                            open_nodes.append(nodo_open)
-                        else:
-                            break
-
-                if not cumple_alguno:
-                    open_nodes = []
-                    break
+            open_nodes = self.resolve_entry_open_nodes(time_actual_np)
 
             if not open_nodes:
                 continue
@@ -807,8 +832,9 @@ class Backtester:
                     continue
 
                 if self.cumple_condiciones_fast(df_struct_c, pos_c - 1, nodo_c["conditions"]):
-                    nodo_close = self.maping_close[nodo_c["key"]]
-                    valid_closes.append(nodo_close)
+                    nodo_close = self.maping_close.get(nodo_c["key"])
+                    if nodo_close is not None:
+                        valid_closes.append(nodo_close)
 
             if not valid_closes:
                 continue
@@ -844,6 +870,14 @@ class Backtester:
                         "vol_20": float(row.vol_20),
                         "zscore_20": float(row.zscore_20),
                         "momentum_ratio": float(row.momentum_ratio),
+                        "event_breakout_up_20": float(getattr(row, 'event_breakout_up_20', 0.0)),
+                        "event_breakout_down_20": float(getattr(row, 'event_breakout_down_20', 0.0)),
+                        "event_volatility_expansion_10": float(getattr(row, 'event_volatility_expansion_10', 0.0)),
+                        "event_momentum_shift_up": float(getattr(row, 'event_momentum_shift_up', 0.0)),
+                        "event_momentum_shift_down": float(getattr(row, 'event_momentum_shift_down', 0.0)),
+                        "event_trend_alignment_up": float(getattr(row, 'event_trend_alignment_up', 0.0)),
+                        "event_trend_alignment_down": float(getattr(row, 'event_trend_alignment_down', 0.0)),
+                        "event_range_impulse": float(getattr(row, 'event_range_impulse', 0.0)),
                         "expected_pips": expected_pips,
                         "normalized_pips": normalized_pips,
                     })
@@ -853,18 +887,8 @@ class Backtester:
         for sample in candidate_samples:
             context_values.setdefault(sample["hour"], []).append(sample["normalized_pips"])
             global_values.append(sample["normalized_pips"])
-
-        def get_thresholds(hour_key):
-            values = context_values.get(hour_key, [])
-            if len(values) < self.label_min_context_samples:
-                values = global_values
-
-            if len(values) < self.label_min_context_samples:
-                return 0.0, 0.0
-
-            upper = float(np.percentile(values, self.label_percentile_threshold))
-            lower = float(np.percentile(values, 100 - self.label_percentile_threshold))
-            return upper, lower
+        effective_percentile = self.get_effective_label_percentile(len(candidate_samples))
+        lower_percentile = 100.0 - effective_percentile
 
         data = {
             'input1': [],
@@ -884,12 +908,31 @@ class Backtester:
             'momentum_ratio': [],
             'output': []
         }
+        for event_column in EVENT_FEATURE_COLUMNS:
+            data[event_column] = []
 
         for sample in candidate_samples:
-            upper_threshold, lower_threshold = get_thresholds(sample["hour"])
+            reference_values = self.select_label_reference_values(
+                sample["hour"],
+                context_values,
+                global_values,
+            )
+            if len(reference_values) < 2:
+                continue
+
+            upper_threshold = float(np.percentile(reference_values, effective_percentile))
+            lower_threshold = float(np.percentile(reference_values, lower_percentile))
             normalized_pips = sample["normalized_pips"]
 
-            if normalized_pips >= upper_threshold:
+            if np.isclose(upper_threshold, lower_threshold):
+                median_threshold = float(np.median(reference_values))
+                if normalized_pips > median_threshold:
+                    label = 1.0
+                elif normalized_pips < median_threshold:
+                    label = 0.0
+                else:
+                    continue
+            elif normalized_pips >= upper_threshold:
                 label = 1.0
             elif normalized_pips <= lower_threshold:
                 label = 0.0
@@ -911,29 +954,11 @@ class Backtester:
             data['vol_20'].append(sample['vol_20'])
             data['zscore_20'].append(sample['zscore_20'])
             data['momentum_ratio'].append(sample['momentum_ratio'])
+            for event_column in EVENT_FEATURE_COLUMNS:
+                data[event_column].append(sample[event_column])
             data['output'].append(label)
 
         df_dataset = pd.DataFrame(data)
-
-        if df_dataset.empty and not allow_empty:
-            df_dataset = pd.DataFrame({
-                'input1': [format(0, "08b")],
-                'input2': [format(1, "08b")],
-                'hour': [format(0, "05b")],
-                'ret_1': [0.0],
-                'range_1': [0.0],
-                'trend': [0.0],
-                'vol': [0.0],
-                'ret_3': [0.0],
-                'ret_10': [0.0],
-                'trend_10': [0.0],
-                'trend_20': [0.0],
-                'vol_10': [0.0],
-                'vol_20': [0.0],
-                'zscore_20': [0.0],
-                'momentum_ratio': [0.0],
-                'output': [0.0]
-            })
 
         return df_dataset
 
@@ -1111,7 +1136,29 @@ class Backtester:
         # =========================
 
         df_dataset = self.build_walk_forward_dataset(self.df_train_B, self.dict_pips_best)
+        if len(df_dataset) < self.min_training_samples or df_dataset['output'].nunique() < 2:
+            df_pre_validation = pd.concat([self.df_train_A, self.df_train_B])
+            df_dataset_fallback = self.build_walk_forward_dataset(df_pre_validation, self.dict_pips_best)
+            if len(df_dataset_fallback) > len(df_dataset):
+                print(
+                    "Fallback de entrenamiento activado | "
+                    f"dataset original={len(df_dataset)} -> expandido={len(df_dataset_fallback)}"
+                )
+                df_dataset = df_dataset_fallback
+
+        if len(df_dataset) < self.min_training_samples or df_dataset['output'].nunique() < 2:
+            raise ValueError(
+                f"Dataset insuficiente para entrenar {self.principal_symbol}-{self.mercado}-{self.algorithm}: "
+                f"samples={len(df_dataset)} classes={df_dataset['output'].nunique()}"
+            )
         df_dataset.to_csv(path_data_red, index=False)
+
+        is_valid, dataset_info = has_minimum_training_data(path_data_red, min_samples=self.min_training_samples)
+        if not is_valid:
+            raise ValueError(
+                f"Dataset inválido para entrenar {self.principal_symbol}-{self.mercado}-{self.algorithm}: "
+                f"{dataset_info['reason']} samples={dataset_info['samples']} classes={dataset_info['class_count']}"
+            )
 
         input1_ids, input2_ids, hour_ids, X_extra, Y, norm_stats = load_data(path_data_red, return_stats=True)
 
@@ -1249,7 +1296,9 @@ class Backtester:
 
                         if self.cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
 
-                            nodo_close = self.maping_close[nodo["key"]]
+                            nodo_close = self.maping_close.get(nodo["key"])
+                            if nodo_close is None:
+                                continue
                             prob = predict_from_inputs(nn, entry_red_open, nodo_close, hour, market_features)
                             if prob > close_threshold:
                                 model_close_signal = True
@@ -1305,37 +1354,18 @@ class Backtester:
 
                 cierre = 0
 
-                for symbol in self.list_symbols:
+                if not self.is_entry_event_active(row):
+                    continue
 
-                    cumple_alguno = False
-                    nodo_open_list = self.dict_nodos[symbol]
-
-                    for nodo in nodo_open_list:
-
-                        df_struct = self.COMBINED[("open", symbol, nodo["file"])]
-                        pos = df_struct["index_values"].searchsorted(time_actual_np)
-                        
-                        if pos == 0:
-                            continue
-
-                        if self.cumple_condiciones_fast(df_struct, pos - 1, nodo["conditions"]):
-
-                            cumple_alguno = True
-
-                            if symbol == self.list_symbols[-1]:
-                                open_price_open = open_price
-                                spread_open = getattr(row, 'spread', 0.0)
-                                current_stop_loss, current_take_profit = self.get_trade_risk_limits(row)
-                                is_open = True
-                                time_comienzo = time_actual
-                                model_close_streak = 0
-                                nodo_open = self.maping_open[nodo["key"]]
-                                entry_red_open = nodo_open
-
-                            break
-
-                    if not cumple_alguno:
-                        break
+                open_nodes = self.resolve_entry_open_nodes(time_actual_np)
+                if open_nodes:
+                    open_price_open = open_price
+                    spread_open = getattr(row, 'spread', 0.0)
+                    current_stop_loss, current_take_profit = self.get_trade_risk_limits(row)
+                    is_open = True
+                    time_comienzo = time_actual
+                    model_close_streak = 0
+                    entry_red_open = open_nodes[0]
 
             if perdidas_seguidas > mas_perdidas_seguidas:
                 mas_perdidas_seguidas = perdidas_seguidas
@@ -1634,7 +1664,21 @@ class Backtester:
         for i in range(self.max_iterations):
             print(f"\n--- Iteración {i+1} ---")
             self.index = i + 1
-            model_data = self.train_iteration()
+            try:
+                model_data = self.train_iteration()
+            except ValueError as exc:
+                print(f"Backtester cancelado por dataset insuficiente: {exc}")
+                self.best_model_data = None
+                self.info_score = {
+                    "skipped": True,
+                    "skip_reason": str(exc),
+                    "selection_reference": {
+                        "raw_reasons": ["insufficient_training_data"],
+                        "deployment_score": -9999.0,
+                        "thresholds": {},
+                    },
+                }
+                break
             last_model_data = model_data
             metrics = self.validate_iteration()
             self.calculate_score(metrics, model_data)
@@ -1651,6 +1695,14 @@ class Backtester:
                 break
 
         self.finalize_best_candidate(last_model_data)
+
+        if self.best_model_data is None:
+            with open(f'output/{self.principal_symbol}/data_for_neuronal/best_score/score_{self.mercado}_{self.algorithm}.json', 'w') as f:
+                json.dump({
+                    "metrics": _sanitize_for_json(self.info_score)
+                }, f, indent=4, allow_nan=False)
+            print(f'tiempo total: {time.time() - self.comienzo:.2f} segundos')
+            return
 
         torch_model_path = f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.pt'
         torch.save(self.best_model_data, torch_model_path)

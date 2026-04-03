@@ -41,7 +41,7 @@
     "NTotal": 50,
     "MinOperationsIS": 50,
     "MinOperationsOS": 20,
-    "NumMaxOperations": 6000,
+    "NumMaxOperations": 5000,
     "MinSuccessRate": 0.5,
     "MaxSuccessRate": 0.55,
     "ProgressiveVariation": 0.05,

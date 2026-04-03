@@ -115,7 +115,7 @@ async def postnode_config(request: ConfigRequest):
 @router.post("/execute-algorithm")
 def execute_algorithm():
     ini = time.time()
-    #reset_database()  # Limpiar base de datos antes de ejecutar el algoritmo
+    reset_database() 
     with open(PATH_GENERAL_CONFIG, 'r', encoding='utf8') as file:
         config = json.load(file)
     list_mercado = ['Asia', 'Europa', 'America'] 
@@ -128,12 +128,12 @@ def execute_algorithm():
     date_start_is, date_end_is = get_previous_4_6(date_start_os, date_end_os)
     
     for symbol in list_principal_symbols:
-        # crear_carpeta_si_no_existe(f'config/divisas/{symbol}')
-        # crear_carpeta_si_no_existe(f'output/{symbol}')
-        # create_files(symbol, timeframe, date_start_os, date_end_os, indicadors_files, 'extrac_os')
-        # create_files(symbol, timeframe, date_start_is, date_end_is, indicadors_files, 'extrac')
-        # execute_node_builder(symbol, list_mercado)
-        # execute_crossing_builder(symbol, list_mercado)
+        crear_carpeta_si_no_existe(f'config/divisas/{symbol}')
+        crear_carpeta_si_no_existe(f'output/{symbol}')
+        create_files(symbol, timeframe, date_start_os, date_end_os, indicadors_files, 'extrac_os')
+        create_files(symbol, timeframe, date_start_is, date_end_is, indicadors_files, 'extrac')
+        execute_node_builder(symbol, list_mercado)
+        execute_crossing_builder(symbol, list_mercado)
         execute_data_for_neuronal(symbol, list_mercado, list_algorithms = None, dict_pips_best= None)  
         execute_entrenar(symbol, list_mercado, list_algorithms = None)
         
@@ -145,7 +145,10 @@ def execute_algorithm():
         ) as executor:
             futures = [executor.submit(_run_backtester, task) for task in tasks]
             for future in concurrent.futures.as_completed(futures):
-                future.result()
+                try:
+                    future.result()
+                except ValueError as exc:
+                    print(f"Backtester omitido por datos insuficientes: {exc}")
                     
     print(f"Tiempo total de ejecución final: {time.time() - ini:.2f} segundos")    
 

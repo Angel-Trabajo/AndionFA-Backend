@@ -24,17 +24,15 @@ class Signal:
         self.principal_symbol = principal_symbol
         self.mercado = mercado
         self.config = config
-        _, _, other_algorithm, last_symbol = self.get_info()
+        _, _, other_algorithm = self.get_info()
         self.other_algorithm = other_algorithm
-        self.last_symbol = last_symbol
 
     def get_info(self):
         if self.algorithm == "UP":
             other_algorithm = "DOWN"
         else:
             other_algorithm = "UP"
-        last_symbol = self.config['symbol']['list_symbol'][-1]
-        return self.algorithm, self.principal_symbol, other_algorithm, last_symbol
+        return self.algorithm, self.principal_symbol, other_algorithm
 
     def get_close_signals(self):
         
@@ -49,7 +47,7 @@ class Signal:
     def get_open_signals(self):
         nodes = db_query.get_nodes(
             principal_symbol=self.principal_symbol, 
-            symbol_cruce=self.last_symbol, 
+            symbol_cruce=self.principal_symbol, 
             mercado=self.mercado, 
             label=self.algorithm
             )
@@ -62,10 +60,18 @@ class Normalizar:
     def __init__(self, signal):
         self.signal = signal
 
+    def _mapping_path(self, kind):
+        return f'output/{self.signal.principal_symbol}/data_for_neuronal/maping/maping_{kind}_{self.signal.mercado}_{self.signal.algorithm}.json'
+
+    def _write_mapping(self, kind, data):
+        with open(self._mapping_path(kind), 'w') as file:
+            json.dump(data, file, indent=4)
+
     def normalize_close_signals(self):
         signal = self.signal.get_close_signals()
         if signal is None:
-            return None
+            self._write_mapping('close', {})
+            return {}
         
       
         count = 8   
@@ -79,15 +85,15 @@ class Normalizar:
             key = json.dumps(elem, sort_keys=True)
             asign[key] = bin(i+1)[2:].zfill(count)  # Convertir a binario de 8 bits
 
-        with open(f'output/{self.signal.principal_symbol}/data_for_neuronal/maping/maping_close_{self.signal.mercado}_{self.signal.algorithm}.json', 'w') as file:
-            json.dump(asign, file, indent=4)
+        self._write_mapping('close', asign)
 
         return asign
 
     def normalize_open_signals(self):
         signal = self.signal.get_open_signals()
         if signal is None:
-            return None
+            self._write_mapping('open', {})
+            return {}
         
       
         count = 8
@@ -101,8 +107,7 @@ class Normalizar:
             key = json.dumps(elem, sort_keys=True)
             asign[key] = bin(i+1)[2:].zfill(count)  # Convertir a binario de 8 bits
 
-        with open(f'output/{self.signal.principal_symbol}/data_for_neuronal/maping/maping_open_{self.signal.mercado}_{self.signal.algorithm}.json', 'w') as file:
-            json.dump(asign, file, indent=4)
+        self._write_mapping('open', asign)
 
         return asign
 
@@ -132,13 +137,8 @@ def data_for_neuronal(config, mercado, algorithm, dict_pips_best= None):
         'hour': [],
         'output': []
     }
-    
-    if dict_pips_best is None:           
-        data['input1'].append(format(0, "08b"))
-        data['input2'].append(format(1, "08b"))
-        data['hour'].append(format(0, "05b"))
-        data['output'].append(0)
-    else:
+
+    if dict_pips_best:
         for key, value in dict_pips_best.items():
             key_parts = key.split('_')
             

@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.optim as optim
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from src.utils.common_functions import crear_carpeta_si_no_existe
+from src.signals.event_generator import EVENT_FEATURE_COLUMNS
 
 
 EXTRA_FEATURE_COLUMNS = [
@@ -23,12 +24,13 @@ EXTRA_FEATURE_COLUMNS = [
     "vol_20",
     "zscore_20",
     "momentum_ratio",
-]
+] + EVENT_FEATURE_COLUMNS
 
 OPEN_NODE_BITS = 8
 CLOSE_NODE_BITS = 8
 HOUR_BITS = 5
 MIN_HOUR_VOCAB = 24
+MIN_TRAINING_SAMPLES = 30
 
 
 
@@ -315,11 +317,11 @@ class BinaryNN(nn.Module):
                     no_improve_epochs += 1
 
                 if loss_val <= self.target_loss:
-                    print(f"\n✔ Early stopping en epoch {epoch}, loss={loss_val:.5f}")
+                    print(f"\nEarly stopping en epoch {epoch}, loss={loss_val:.5f}")
                     break
 
                 if no_improve_epochs >= 6:
-                    print(f"\n✔ Early stopping por validación en epoch {epoch}, objective={best_val_objective:.4f}")
+                    print(f"\nEarly stopping por validacion en epoch {epoch}, objective={best_val_objective:.4f}")
                     break
 
         if best_state_dict is not None:
@@ -582,10 +584,11 @@ def predict_from_inputs(nn, input1, input2, hour, extra_features=None):
         extra = np.asarray(extra_features, dtype=np.float32).reshape(-1)
 
     if extra.shape[0] != nn.input_dim_extra:
-        raise ValueError(
-            "Dimensión inválida en extra_features: "
-            f"received={extra.shape[0]}, expected={nn.input_dim_extra}"
-        )
+        if extra.shape[0] > nn.input_dim_extra:
+            extra = extra[:nn.input_dim_extra]
+        else:
+            padding = np.zeros(nn.input_dim_extra - extra.shape[0], dtype=np.float32)
+            extra = np.concatenate([extra, padding])
 
     if feature_mean is not None and feature_std is not None:
         extra = (extra - feature_mean) / (feature_std + 1e-8)
@@ -634,6 +637,25 @@ def load_data(csv_file, return_stats=False):
         return input1_arr, input2_arr, hour_arr, X_extra, Y, {"mean": mean, "std": std}
 
     return input1_arr, input2_arr, hour_arr, X_extra, Y
+
+
+def has_minimum_training_data(csv_file, min_samples=MIN_TRAINING_SAMPLES, min_class_count=2):
+    if not os.path.exists(csv_file):
+        return False, {"reason": "missing_file", "samples": 0, "class_count": 0}
+
+    df = pd.read_csv(csv_file)
+    if df.empty:
+        return False, {"reason": "empty_file", "samples": 0, "class_count": 0}
+
+    samples = int(len(df))
+    class_count = int(df["output"].nunique()) if "output" in df.columns else 0
+
+    if samples < min_samples:
+        return False, {"reason": "low_samples", "samples": samples, "class_count": class_count}
+    if class_count < min_class_count:
+        return False, {"reason": "single_class", "samples": samples, "class_count": class_count}
+
+    return True, {"reason": "ok", "samples": samples, "class_count": class_count}
   
 
 def execute_entrenar(principal_symbol, mercados, list_algorithms = None):
@@ -644,6 +666,13 @@ def execute_entrenar(principal_symbol, mercados, list_algorithms = None):
     for algorithm in list_algorithms:
         for mercado in mercados:
             path = f'output/{principal_symbol}/data_for_neuronal/data/data_{mercado}_{algorithm}.csv' 
+            is_valid, dataset_info = has_minimum_training_data(path)
+            if not is_valid:
+                print(
+                    f"Saltando entrenamiento {principal_symbol}-{mercado}-{algorithm}: "
+                    f"{dataset_info['reason']} | samples={dataset_info['samples']} | classes={dataset_info['class_count']}"
+                )
+                continue
             input1_ids, input2_ids, hour_ids, X_extra, Y, norm_stats = load_data(path, return_stats=True)
             print("Datos cargados:")
             print("X_extra shape:", X_extra.shape)

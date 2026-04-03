@@ -1,37 +1,65 @@
+import os
+import json
 import pandas as pd
+import numpy as np
 
-df = pd.read_csv("output/AUDCHF/data_for_neuronal/data/data_Asia_DOWN.csv")
 
-print("Tipos de datos:")
-print(df.dtypes)
+base_path_results = 'output/y_backtest_results'
+list_symbols = os.listdir(base_path_results)
+if 'paths_win.json' in list_symbols:
+    list_symbols.remove('paths_win.json')
+list_algorithms = os.listdir(f'{base_path_results}/{list_symbols[0]}')
+list_paths_win = []
+for symbol in list_symbols:
+    for algorithm in list_algorithms:
+        path = f'{base_path_results}/{symbol}/{algorithm}/results.csv'
+        df = pd.read_csv(path)
+        sumpis = df['pips'].sum()
+        if sumpis > 0:  
+            list_paths_win.append(path)
+data = {
+    "paths": list_paths_win
+}
+with open(f'{base_path_results}/paths_win.json', 'w') as file:
+    json.dump(data, file, indent=4)
 
-print("\nPrimeras filas (RAW):")
-print(df[["input1", "input2", "hour"]].head(10))
 
-print("\nChequeo de longitudes:")
-
-for col, expected_len in [("input1", 8), ("input2", 8), ("hour", 5)]:
-    lengths = df[col].astype(str).apply(len)
-    print(f"\n{col}:")
-    print("Min len:", lengths.min())
-    print("Max len:", lengths.max())
-    print("Ejemplos únicos cortos:")
-    print(df[col].astype(str).unique()[:10])
+paths_win = 'output/y_backtest_results/paths_win.json'
+with open(paths_win, 'r') as file:
+    paths_win_data = json.load(file)
+list_paths_win = paths_win_data.get("paths", [])
+for path in list_paths_win:
+    path = path.replace('/y_backtest_results/','/') 
+    list_palabras = path.split('/')
+    list_palabras[2:2] = ['data_for_neuronal', 'best_score']
+    list_palabras.remove('results.csv')
+    name = list_palabras[-1]
+    name = f'score_{name}.json'
+    list_palabras[-1] = name
+    path = '/'.join(list_palabras)
+    with open(path, 'r') as file:
+        data = json.load(file)
+    metrics = data.get("metrics", {})
     
-def has_leading_zero(x):
-    s = str(x)
-    return s.startswith("0")
-
-for col in ["input1", "input2", "hour"]:
-    count = df[col].astype(str).apply(has_leading_zero).sum()
-    print(f"{col} con ceros a la izquierda:", count)
-    
-df_str = pd.read_csv("output/AUDCHF/data_for_neuronal/data/data_Asia_DOWN.csv", dtype=str)
-
-print("\nLeído como string:")
-print(df_str[["input1", "input2", "hour"]].head(10))
-
-print("\nLongitudes reales:")
-for col in ["input1", "input2", "hour"]:
-    lengths = df_str[col].apply(len)
-    print(f"{col}: min={lengths.min()}, max={lengths.max()}")
+    list_pips_monthly = list(metrics.get("temporal_stats", {}).get("monthly_pips",{}).values())
+    def score(fila):
+        fila = np.array(fila)
+        
+        suma = np.sum(fila)
+        volatilidad = np.std(fila)
+        maximo = np.max(fila)
+        minimo = np.min(fila)
+        
+        return (
+            0.4 * suma
+            - 0.3 * volatilidad
+            + 0.2 * maximo
+            + 0.1 * minimo
+        )
+        
+    def probabilidad(score):
+        import math
+        return 1 / (1 + math.exp(-score / 100))
+    s = score(list_pips_monthly)
+    prob = probabilidad(s) 
+    print(prob)
