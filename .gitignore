@@ -200,3 +200,4 @@ pip-selfcheck.json
 *.whl
 *.png
 Ext*.json
+backup/*.sql
