@@ -2,11 +2,11 @@ import json
 import os
 import sys
 import logging
+import threading
 from datetime import time
 import time as tim
 import operator
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import Process
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 
@@ -16,9 +16,8 @@ import numpy as np
 from src.routes import peticiones
 from src.db import query as db_query
 from src.signals.event_generator import add_event_features
-from src.utils.indicadores_for_crossing import extract_indicadores
 from src.utils.constructor_node import NodeGenerator
-from src.utils.extrat_data_for_crossing import extract_data_crossing, select_symbols_correl
+from src.utils.extrat_data_for_crossing import select_symbols_correl
 from src.utils.common_functions import filtro_mercado, hora_en_mercado
 
 
@@ -263,7 +262,8 @@ def selecte_nodes(
         porcent_aumento_os,
         porcent_aumento_is,
         config,
-        mercado
+        mercado,
+        log_q=None
     ):
     
     por_direccion = config['general']['por_direccion']
@@ -271,10 +271,13 @@ def selecte_nodes(
     principal_symbol = config['principal_symbol']
     list_symbol = config['symbol']['list_symbol']
     ini = tim.time()
-    cant_nodos = int(config['general'].get('cant_nodos', 500))
+    cant_nodos = int(config['general'].get('cant_nodos', 1000))
     cant_nodos = max(50, cant_nodos)
     list_nodos = node_generator.generar_nodos(cant_nodos)
-    print(f"{cant_nodos} Nodos generados en {tim.time() - ini:.4f} segundos")
+    _msg_nodos = f"{cant_nodos} Nodos generados en {tim.time() - ini:.4f} segundos"
+    print(_msg_nodos)
+    if log_q is not None:
+        log_q.put(_msg_nodos)
     
     # pip_size/point_size se calculan tras cargar precios
     if por_direccion:
@@ -286,7 +289,7 @@ def selecte_nodes(
     ext = file.split('_')[0]
     dire = next(
         f for f in os.listdir(
-            f'output/{principal_symbol}/crossing/{symbol}/extrac_os'
+            f'output/symbol_data/{symbol}/extrac_os'
         )
         if ext in f
     )
@@ -294,13 +297,13 @@ def selecte_nodes(
     
      
    
-    is_path = f'output/{principal_symbol}/crossing/{symbol}/extrac/{file}'
+    is_path = f'output/symbol_data/{symbol}/extrac/{file}'
     indicators_is = pd.read_parquet(is_path)
     # Convertir time a datetime ANTES de slice/copy
     if 'time' in indicators_is.columns and not pd.api.types.is_datetime64_any_dtype(indicators_is['time']):
         indicators_is['time'] = pd.to_datetime(indicators_is['time'])
      
-    df_bas = load_csv_cached(f'output/{principal_symbol}/is_os/is.csv')
+    df_bas = load_csv_cached(f'output/symbol_data/{principal_symbol}/is_os/is.csv')
     # Convertir time a datetime ANTES de slice/copy
     if 'time' in df_bas.columns and not pd.api.types.is_datetime64_any_dtype(df_bas['time']):
         df_bas['time'] = pd.to_datetime(df_bas['time'])
@@ -532,6 +535,8 @@ def selecte_nodes(
                 db_query.eliminar_nodo_y_registros(nodo_mas_parecido['node_id']) 
             elif porciento >=config['general']['SimilarityMax'] and nodo_mas_parecido['total_operations'] >= total_is: 
                 print('Mayor pero el de la db mejor')
+                if log_q is not None:
+                    log_q.put('Mayor pero el de la db mejor')
                 continue
                
     
@@ -555,19 +560,22 @@ def selecte_nodes(
             fechas_os=list_dates_os,
             veneficios_os=list_beneficio_os,    
         )
-        print(
+        _msg_nodo = (
             f"Nodo insertado: symbol={symbol} action={action} mercado={mercado} "
             f"porcentaje_is={porcentaje_aciertos_is:.4f} porcentaje_os={porcentaje_os:.4f} "
             f"score_is={stats_is['quality_score']:.3f} score_os={stats_os['quality_score']:.3f} "
             f"pf_is={stats_is['profit_factor']:.2f} pf_os={stats_os['profit_factor']:.2f} "
             f"total_is={total_is} total_os={total}"
         )
+        print(_msg_nodo)
+        if log_q is not None:
+            log_q.put(_msg_nodo)
 
 
-def procesar_archivo(file: str, symbol, action, cont, prev_os, prev_is, porcent_aumento_os, porcent_aumento_is, NumMaxOperations, config, mercado):
+def procesar_archivo(file: str, symbol, action, cont, prev_os, prev_is, porcent_aumento_os, porcent_aumento_is, NumMaxOperations, config, mercado, log_q=None):
     principal_symbol = config['principal_symbol']
-    df = pd.read_parquet(f'output/{principal_symbol}/crossing/{symbol}/extrac/{file}')
-    df_bas = load_csv_cached(f'output/{principal_symbol}/is_os/is.csv')
+    df = pd.read_parquet(f'output/symbol_data/{symbol}/extrac/{file}')
+    df_bas = load_csv_cached(f'output/symbol_data/{principal_symbol}/is_os/is.csv')
     df = enrich_with_event_features(df, df_bas)
     df_generator = df.iloc[:int(len(df)*0.2)].copy()  # Para no modificar el original
     node_generator = NodeGenerator(df_generator)
@@ -585,7 +593,8 @@ def procesar_archivo(file: str, symbol, action, cont, prev_os, prev_is, porcent_
             porcent_aumento_os,
             porcent_aumento_is,
             config,
-            mercado
+            mercado,
+            log_q=log_q,
         )
         operaciones_exitosas = (
             db_query.successful_operations_by_label(
@@ -597,18 +606,16 @@ def procesar_archivo(file: str, symbol, action, cont, prev_os, prev_is, porcent_
             )
         )
 
-        print(
+        _msg_ops = (
             f"Operaciones exitosas mercado {mercado} "
             f"{symbol}-{action}: "
             f"{operaciones_exitosas}"
         )
+        print(_msg_ops)
+        if log_q is not None:
+            log_q.put(_msg_ops)
         
    
-def init_worker():
-    import weka.core.jvm as jvm
-    if not jvm.started:
-        jvm.start(packages=True)
-
 
 def calcular_porcentage(symbol, prev, config):
     sumatoria = 0
@@ -619,26 +626,26 @@ def calcular_porcentage(symbol, prev, config):
     return corre/sumatoria * (1-prev)
 
 
-def create_trees(symbol, action, cont, prev_os, prev_is, NumMaxOperations, mercado, config):
-    principal_symbol = config['principal_symbol']
-
+def create_trees(symbol, action, cont, prev_os, prev_is, NumMaxOperations, mercado, config, log_q=None):
+   
     list_files = os.listdir(
-        f'output/{principal_symbol}/crossing/{symbol}/extrac'
+        f'output/symbol_data/{symbol}/extrac'
     )
     
     porcent_aumento_os =calcular_porcentage(symbol, prev_os, config)
     porcent_aumento_is =calcular_porcentage(symbol, prev_is, config)
     
-    MAX_PROCESOS = len(list_files) # ajustable según CPU
-    if MAX_PROCESOS > 20:
-        MAX_PROCESOS = 20
+    MAX_PROCESOS =  int(config['general'].get('use_proces', 25))//2# ajustable según CPU
+    
     
     with ProcessPoolExecutor(
         max_workers=MAX_PROCESOS,
     ) as executor:
 
         futures = []
-        for file in list_files:
+        for i in range(MAX_PROCESOS):
+            indice = i % len(list_files)  # Para asegurar que el índice no exceda el número de archivos
+            file = list_files[indice]
             futures.append(
                 executor.submit(
                     procesar_archivo,
@@ -652,7 +659,8 @@ def create_trees(symbol, action, cont, prev_os, prev_is, NumMaxOperations, merca
                     porcent_aumento_is,
                     NumMaxOperations,
                     config,
-                    mercado
+                    mercado,
+                    log_q,
                 )
             )
             
@@ -663,7 +671,7 @@ def create_trees(symbol, action, cont, prev_os, prev_is, NumMaxOperations, merca
                 logger.exception("Error en proceso hijo de create_trees")
 
     
-def _execute_crossing_builder(action, config):
+def _execute_crossing_builder(action, config, log_q=None):
      
     for mercado in config["list_mercado"]:
         cont = 0
@@ -694,7 +702,7 @@ def _execute_crossing_builder(action, config):
             if prev_os is None:
                 prev_os = 0.0
             
-            print(prev_os, prev_is, '---------')
+            print(f"{prev_os} {prev_is} ---------")
             if prosedio:
                 cont_symbol = len(list_symbol) - cont
                 total_dismin = calcular_descuento(
@@ -702,29 +710,25 @@ def _execute_crossing_builder(action, config):
                     min_operaciones,
                     cont_symbol
                 )
-
                 print(
                     f"Se descuenta {total_dismin:.4f} "
                     f" {NumMaxOperations} "
                     f"por tener {cont_symbol} símbolos restantes"
                 )
-
                 NumMaxOperations -= NumMaxOperations * total_dismin
 
-            create_trees(symbol, action, cont, prev_os, prev_is,NumMaxOperations, mercado, config)
+            create_trees(symbol, action, cont, prev_os, prev_is, NumMaxOperations, mercado, config, log_q=log_q)
             cont += 1
-            prosedio = True    
-            print("NumMaxOperations actual:", NumMaxOperations)
+            prosedio = True
+            print(f"NumMaxOperations actual: {NumMaxOperations}")
          
 
-def execute_crossing_builder(principal_symbol, list_mercado):
+def execute_crossing_builder(principal_symbol, list_mercado, log_q=None):
     inicio =tim.time()           
     peticiones.initialize_mt5()
     tim.sleep(3)
     
-    extract_data_crossing(principal_symbol)
     select_symbols_correl(principal_symbol)
-    extract_indicadores(principal_symbol)
     
     with open('config/general_config.json', 'r', encoding='utf-8') as f:
         general_config = json.load(f)
@@ -737,26 +741,18 @@ def execute_crossing_builder(principal_symbol, list_mercado):
         "principal_symbol": principal_symbol,
         "list_mercado": list_mercado
     }
-     # Crear y ejecutar procesos para 'UP' y 'DOWN'
-    
-    p1 = Process(
-    target=_execute_crossing_builder,
-    args=('UP', config)
-)
 
-    p2 = Process(
-        target=_execute_crossing_builder,
-        args=('DOWN', config)
-    )
-    p1.start()
-    tim.sleep(5)  # Esperar un poco antes de iniciar el segundo proceso
-    p2.start()
+    # Usamos hilos para UP y DOWN: comparten sys.stdout con el proceso padre,
+    # por lo que todos los print() llegan automáticamente al frontend.
+    t1 = threading.Thread(target=_execute_crossing_builder, args=('UP', config, log_q), daemon=False)
+    t2 = threading.Thread(target=_execute_crossing_builder, args=('DOWN', config, log_q), daemon=False)
+    t1.start()
+    tim.sleep(5)  # Esperar un poco antes de iniciar el segundo hilo
+    t2.start()
 
-    # Esperar a que terminen
-    p1.join()
-    p2.join()
-    print("Ambos procesos han terminado.")
-    
+    t1.join()
+    t2.join()
+    print("Ambos hilos han terminado.")
     print(f"Tiempo de creación: {tim.time() - inicio:.4f} segundos")
  
 if __name__ == "__main__":

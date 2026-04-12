@@ -103,3 +103,42 @@ def hora_en_mercado(hour, mercado):
         return 14 <= hour <= 22
 
     return True
+
+
+def should_backtest_strategy(metrics):
+    import math
+    import numpy as np
+
+    winrate = metrics.get("winrate", 0)
+    profit_factor = metrics.get("profit_factor", 0)
+    expectancy = metrics.get("expectancy", 0)
+    list_pips_monthly = list(metrics.get("temporal_stats", {}).get("monthly_pips", {}).values())
+
+    def score(fila):
+        fila = np.array(fila)
+        suma = np.sum(fila)
+        volatilidad = np.std(fila)
+        maximo = np.max(fila)
+        minimo = np.min(fila)
+        return (
+            0.4 * suma
+            - 0.3 * volatilidad
+            + 0.2 * maximo
+            + 0.1 * minimo
+        )
+
+    def probabilidad(s):
+        return 1 / (1 + math.exp(-s / 100))
+
+    if not list_pips_monthly:
+        return False
+
+    s = score(list_pips_monthly)
+    prob = probabilidad(s)
+
+    return (
+        winrate >= 0.40 and
+        profit_factor >= 1 and
+        expectancy >= 1 and
+        prob >= 0.55
+    )

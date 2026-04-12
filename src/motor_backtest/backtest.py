@@ -10,12 +10,12 @@ import matplotlib.dates as mdates
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-from src.routes.peticiones import get_historical_data, get_timeframes
+from src.routes.peticiones import get_historical_data, get_timeframes, initialize_mt5
 from src.utils.indicadores_for_principal_script import generate_files
 from src.db.query import get_nodes_by_label
 from src.neuronal.entrenar import EXTRA_FEATURE_COLUMNS, load_trained_model, predict_from_inputs, load_data, validate_embedding_vocab
 from src.signals.event_generator import add_event_features, has_entry_event
-from src.utils.common_functions import hora_en_mercado, crear_carpeta_si_no_existe
+from src.utils.common_functions import hora_en_mercado, crear_carpeta_si_no_existe, should_backtest_strategy
 
 
 def plot_all_backtests_results(base_dir='output/x_backtest_results'):
@@ -99,42 +99,6 @@ def get_pip_and_point_size(symbol, price_series):
     return pip_size, point_size
 
 
-def should_backtest_strategy(metrics):
-    winrate = metrics.get("winrate", 0)
-    profit_factor = metrics.get("profit_factor", 0)
-    expectancy = metrics.get("expectancy", 0)
-    list_pips_monthly = list(metrics.get("temporal_stats", {}).get("monthly_pips",{}).values())
-    
-    def score(fila):
-        fila = np.array(fila)
-        
-        suma = np.sum(fila)
-        volatilidad = np.std(fila)
-        maximo = np.max(fila)
-        minimo = np.min(fila)
-        
-        return (
-            0.4 * suma
-            - 0.3 * volatilidad
-            + 0.2 * maximo
-            + 0.1 * minimo
-        )
-        
-    def probabilidad(score):
-        import math
-        return 1 / (1 + math.exp(-score / 100))
-    s = score(list_pips_monthly)
-    prob = probabilidad(s)  
-    
-    decision =(
-        winrate >= 0.45 and
-        profit_factor >= 1.5 and
-        expectancy >= 10 and
-        prob >= 0.77
-    )
-    
-    return decision
-
 class Backtest:
     
     def __init__(self, principal_symbol, mercado, algorithm, date_start, date_end):
@@ -159,7 +123,7 @@ class Backtest:
         self.horas_mercado = [hora_en_mercado(h, self.mercado) for h in range(24)]    
         self.list_symbols = self.config_symbol['list_symbol']
         self.list_symbols.insert(0, self.principal_symbol)
-        self.timeframe = get_timeframes().get(self.general_config['timeframe'])
+        self.timeframe = get_timeframes()['timeframes'].get(self.general_config['timeframe'])
         self.base_data = self.prepare_base_data()
         self.pip_size, self.point_size = get_pip_and_point_size(
             self.principal_symbol,
@@ -172,14 +136,14 @@ class Backtest:
             "bars_held": [],
             "close_reason": [],
         }
-        self.stop_loss = 20
-        self.take_profit = 150
+        self.stop_loss = int(self.general_config.get('stop_loss', 20))
+        self.take_profit = int(self.general_config.get('take_profit', 150))
         self.max_holding = 120
         self.min_model_holding = 15
         self.close_confirmation_bars = 2
         self.close_threshold_floor = 0.60
         self.min_open_symbol_confirmations = int(
-            self.general_config.get('MinOpenSymbolConfirmations', 4)
+        self.general_config.get('MinOpenSymbolConfirmations', 4)
         )
         
         self.setup_operators_and_mappings()
@@ -187,8 +151,11 @@ class Backtest:
         self.calculate_indicators()
         
         
-    def prepare_base_data(self):    
-        data = get_historical_data(self.principal_symbol, self.timeframe, self.date_start, self.date_end)
+    def prepare_base_data(self):   
+        result = get_historical_data(self.principal_symbol, self.timeframe, self.date_start, self.date_end)
+        if 'data' not in result:
+            raise ValueError(f"No se pudo obtener datos para {self.principal_symbol}: {result.get('error', 'unknown error')}")
+        data = result['data']
         df = pd.DataFrame(data)
         df['time'] = pd.to_datetime(df['time'], unit='s')
         df['ret_1'] = df['close'] - df['open']
@@ -311,8 +278,11 @@ class Backtest:
     def calculate_indicators(self):
         print(f"Calculando indicadores para {self.principal_symbol}...")
         list_files = self.general_config['indicators_files']
+        count_proces = int(self.general_config.get('use_proces', 40))//2
+        if len(list_files) > count_proces:
+            list_files = list_files[:count_proces]
         for symbol in self.list_symbols:
-            data = get_historical_data(symbol, self.timeframe, self.date_start, self.date_end)
+            data = get_historical_data(symbol, self.timeframe, self.date_start, self.date_end)['data']
             df = pd.DataFrame(data)
             df['time'] = pd.to_datetime(df['time'], unit='s')   
             for file in list_files:
@@ -396,7 +366,7 @@ class Backtest:
         is_open = False
         open_price_open = 0.0
         spread_open = 0.0
-        entry_red_open = ''
+        entry_red_open = []
         cierre = 0
         model_close_streak = 0
         time_comienzo = None
@@ -446,9 +416,12 @@ class Backtest:
                             nodo_close = self.maping_close.get(nodo["key"])
                             if nodo_close is None:
                                 continue
-                            prob = predict_from_inputs(nn, entry_red_open, nodo_close, hour, market_features)
-                            if prob > self.close_threshold:
-                                model_close_signal = True
+                            for entry in entry_red_open:
+                                prob = predict_from_inputs(nn, entry, nodo_close, hour, market_features)
+                                if prob > self.close_threshold:
+                                    model_close_signal = True
+                                    break
+                            if model_close_signal:
                                 break
 
                 if model_close_signal:
@@ -490,7 +463,7 @@ class Backtest:
                     is_open = True
                     time_comienzo = time_actual
                     model_close_streak = 0
-                    entry_red_open = open_nodes[0]
+                    entry_red_open = open_nodes
 
         return self.results
 
@@ -556,30 +529,49 @@ class Backtest:
       
     
 if __name__ == "__main__":
-    
+    initialize_mt5()
     with open('config/general_config.json', 'r', encoding='utf8') as file:
         config = json.load(file)
+    backtest_config_path = 'config/backtest_config.json'
+    if not os.path.exists(backtest_config_path):
+        with open(backtest_config_path, 'w', encoding='utf8') as file:
+            json.dump(
+                {
+                    "backtest_config": {
+                        "date_start": "2025-01-01",
+                        "date_end": "2026-01-01"
+                    }
+                },
+                file,
+                indent=4,
+                ensure_ascii=False,
+            )
+
+    with open(backtest_config_path, 'r', encoding='utf8') as file:
+        backtest_config = json.load(file)['backtest_config']
     list_mercado = ['Asia', 'Europa', 'America'] 
     list_algorithms = ['UP', 'DOWN']
     list_principal_symbols = config['list_principal_symbols']
-    date_start = "2023-01-01"
-    date_end = "2023-06-01"
-    for principal_symbol in list_principal_symbols:
+    date_start = backtest_config.get("date_start", "2025-01-01")
+    date_end = backtest_config.get("date_end", "2026-01-01")
+    for principal_symbol in list_principal_symbols[0:3]:
         for mercado in list_mercado:
             for algorithm in list_algorithms:
                 with open(f'output/{principal_symbol}/data_for_neuronal/best_score/score_{mercado}_{algorithm}.json', 'r') as file:
                     best_score_data = json.load(file)
                 metrics = best_score_data.get("metrics", {})
                 should_run = should_backtest_strategy(metrics)
-                # if not should_run:
-                #     print(
-                #         f"Saltando backtest para {principal_symbol} - {mercado} - {algorithm} "
-                #     )
-                #     continue
+                if not should_run:
+                    print(
+                        f"Saltando backtest para {principal_symbol} - {mercado} - {algorithm} "
+                    )
+                    continue
               
-                backtest = Backtest(principal_symbol, mercado, algorithm, date_start, date_end)
-                backtest.run()
-    # backtest = Backtest('AUDCHF', 'Asia', 'UP', date_start, date_end)
-    # backtest.run()
+                try:
+                    backtest = Backtest(principal_symbol, mercado, algorithm, date_start, date_end)
+                    backtest.run()
+                except ValueError as e:
+                    print(f"Saltando backtest para {principal_symbol} - {mercado} - {algorithm}: {e}")
+                    continue
     plot_all_backtests_results('output/x_backtest_results')
     

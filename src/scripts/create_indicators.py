@@ -13,12 +13,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")
 from src.utils.common_functions import limpiar_carpeta, crear_carpeta_si_no_existe
 from src.routes import peticiones
 
-PATH_BASE = 'output/{}'
-PATH_DATA_IS = 'output/{}/is_os/is.csv'
-PATH_DATA_OS = 'output/{}/is_os/os.csv'
+PATH_BASE = 'output/symbol_data/{}'
+PATH_DATA_IS = 'output/symbol_data/{}/is_os/is.csv'
+PATH_DATA_OS = 'output/symbol_data/{}/is_os/os.csv'
 
 
-_mapping_time = peticiones.get_timeframes()
+_mapping_time = peticiones.get_timeframes()['timeframes']
 
 
 replaceString = {
@@ -38,7 +38,10 @@ def _get_data_mt5(symbol, timeframe, start, end, folder):
     
     timeframe = _mapping_time.get(timeframe)
     
-    rates = peticiones.get_historical_data(symbol, timeframe, start, end)
+    response = peticiones.get_historical_data(symbol, timeframe, start, end)
+    if 'error' in response:
+        raise RuntimeError(f"MT5 data error for {symbol} [{start} - {end}]: {response['error']}")
+    rates = response['data']
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s")
     if folder == 'extrac':
@@ -320,7 +323,8 @@ def _generate_files(indicator_file, pos, symbol, start, end, timeframe, folder):
 )
 
        
-def create_files(symbol, timeframe, str_start, end, indicators_files, folder):
+def create_files(symbol, timeframe, str_start, end, indicators_files, folder, max_workers):
+    
     crear_carpeta_si_no_existe(f'{PATH_BASE.format(symbol)}/is_os')
     crear_carpeta_si_no_existe(f'{PATH_BASE.format(symbol)}/extrac')
     crear_carpeta_si_no_existe(f'{PATH_BASE.format(symbol)}/extrac_os')
@@ -329,15 +333,15 @@ def create_files(symbol, timeframe, str_start, end, indicators_files, folder):
     start = datetime.strptime(str_start, '%Y-%m-%d')
     pos, _ = _buscar_fecha_o_siguiente(df, start)
     
-    # Número máximo de subprocesos simultáneos
-    max_workers = min(30, len(indicators_files))
-    
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+    proces = min(max_workers//2, len(indicators_files))
+    with concurrent.futures.ProcessPoolExecutor(max_workers=proces) as executor:
         # Diccionario para hacer seguimiento de los futuros
         futures = {}
         
         # Enviamos todos los trabajos al executor
-        for file in indicators_files:
+        for i in range(proces):
+            indice = i % len(indicators_files)
+            file = indicators_files[indice]
             future = executor.submit(
                 _generate_files, 
                 file, pos, symbol, str_start, end, timeframe, folder

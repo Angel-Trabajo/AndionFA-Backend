@@ -1,19 +1,5 @@
-malas:
-GBPTRY
-GBPSEK
-GBPNOK
-GBPMXN
-EURTRY
-EURMXN
-EURNOK
-EURSEK
-"USDMXN",
-"USDNOK",
-"USDSGD",
-
-hechas:
     "AUDCHF",
-    "AUDNZD",
+    "AUDCAD",
     "AUDUSD",
     "CADCHF",
     "CADJPY",
@@ -38,12 +24,5 @@ hechas:
     "USDCAD",
     "USDCHF",
     "USDJPY",
-    "USDSEK"
-
-faltan:
-    "AUDJPY",
-    "AUDCAD",
-    "USDTRY",
-    "AUDCHF",
-    "AUDNZD"
-    
+    "USDSEK",
+    "USDTRY"

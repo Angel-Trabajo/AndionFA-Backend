@@ -16,6 +16,7 @@ __pycache__/
 *.db-wal
 *.sqlite
 *.parquet
+*.sql
 
 # Distribution / packaging
 .Python

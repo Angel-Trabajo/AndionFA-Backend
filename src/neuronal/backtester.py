@@ -19,9 +19,8 @@ from dateutil.relativedelta import relativedelta
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-from src.routes.peticiones import get_historical_data, get_timeframes
 from src.db.query import get_nodes_by_label
-from src.utils.indicadores_for_crossing import extract_indicadores
+
 from src.utils.common_functions import get_previous_4_6, hora_en_mercado
 from src.neuronal.entrenar import (
     EXTRA_FEATURE_COLUMNS,
@@ -82,7 +81,7 @@ def _sanitize_for_json(value):
 
 class Backtester:
 
-    def __init__(self, principal_symbol, mercado, algorithm, date_end=None):
+    def __init__(self, principal_symbol, mercado, algorithm):
 
         print("Starting backtest...")
         self.comienzo = time.time()
@@ -119,7 +118,6 @@ class Backtester:
             "calmar_ratio": 1.8,
             "sortino_ratio": 1.5,
         }
-        self.robust_trade_penalty_center = 25
         self.robust_trade_penalty_scale = 12
         self.robust_min_avg_bars = 12
         self.ensemble_top_k = 3
@@ -127,7 +125,7 @@ class Backtester:
         self.label_percentile_threshold = 65
         self.label_min_context_samples = 25
         self.label_volatility_floor_pips = 5.0
-        self.min_winning_iteration = 8
+        self.min_winning_iteration = 1
         self.max_iterations = 15
         self.early_stopping_patience = 8
         self.no_improve_iterations = 0
@@ -159,7 +157,6 @@ class Backtester:
         }
         self.train_b_label_blocks = 3
         self.min_training_samples = MIN_TRAINING_SAMPLES
-        self.data_end = date_end
         self.principal_symbol = principal_symbol
         self.mercado = mercado
         self.algorithm = algorithm
@@ -201,6 +198,11 @@ class Backtester:
         self.min_open_symbol_confirmations = int(
             self.general_config.get('MinOpenSymbolConfirmations', self.min_open_symbol_confirmations)
         )
+        self.robust_trade_penalty_center = int(
+            self.general_config.get('robust_trade_penalty_center', 25)
+        )
+        self.stop_loss = int(self.general_config.get('stop_loss', self.stop_loss))
+        self.take_profit = int(self.general_config.get('take_profit', self.take_profit))
         data_start_is, data_end_is = get_previous_4_6(
             self.general_config['dateStart'], 
             self.general_config['dateEnd']
@@ -210,48 +212,22 @@ class Backtester:
         
     def prepare_base_data(self):
 
-        if self.data_end is None:
-            df_is = pd.read_csv(f'output/{self.principal_symbol}/is_os/is.csv')
-            df_os = pd.read_csv(f'output/{self.principal_symbol}/is_os/os.csv')
+        df_is = pd.read_csv(f'output/symbol_data/{self.principal_symbol}/is_os/is.csv')
+        df_os = pd.read_csv(f'output/symbol_data/{self.principal_symbol}/is_os/os.csv')
 
-            df_base1 = (
-                pd.concat([df_is, df_os], ignore_index=True)
-                .drop_duplicates(subset='time')
+        df_base1 = (
+            pd.concat([df_is, df_os], ignore_index=True)
+            .drop_duplicates(subset='time')
+        )
+
+        df_base1['time'] = pd.to_datetime(df_base1['time'])
+
+        df_base = df_base1[
+            df_base1['time'] >= datetime.strptime(
+                self.data_start_is, '%Y-%m-%d'
             )
+        ]
 
-            df_base1['time'] = pd.to_datetime(df_base1['time'])
-
-            df_base = df_base1[
-                df_base1['time'] >= datetime.strptime(
-                    self.data_start_is, '%Y-%m-%d'
-                )
-            ]
-        else:
-            timeframes = get_timeframes()
-            fecha_str = self.data_end
-            fecha_dt = datetime.strptime(fecha_str, "%Y-%m-%d")
-
-            # Restar 6 años
-            fecha_6_atras = fecha_dt - relativedelta(years=3)
-
-            # Volver a formato string
-            fecha_6_atras_str = fecha_6_atras.strftime("%Y-%m-%d")
-            timeframe = timeframes.get(self.general_config['timeframe']) 
-            rates = get_historical_data(self.principal_symbol, timeframe, fecha_6_atras_str, self.data_end)
-            df_base = pd.DataFrame(rates)
-            df_base['time'] = pd.to_datetime(df_base['time'], unit='s')
-            df_base_for_indicators = df_base.copy()
-            list_files_ = os.listdir(f'output/{self.principal_symbol}/extrac_os')
-            indicadores_m =pd.read_parquet(f'output/{self.principal_symbol}/extrac_os/{list_files_[0]}', columns=['time'])
-            time_ultimo_indicador = indicadores_m['time'].iloc[-1]
-            index_coincidencia = df_base_for_indicators[df_base_for_indicators['time'] == time_ultimo_indicador].index[0]
-            if index_coincidencia >= 830:
-                df_base_for_indicators = df_base_for_indicators.iloc[index_coincidencia-830:]
-            print(len(df_base_for_indicators))
-            if len(df_base_for_indicators) - 830 > 20:
-                extract_indicadores(self.principal_symbol, df_base_for_indicators)
-            
-            
         df_base = df_base.sort_values('time').set_index('time')
         df_base = self.add_market_features(df_base)
         self.split_temporal_windows(df_base)
@@ -1076,15 +1052,15 @@ class Backtester:
         # CLOSE
         FILES_OS_CLOSE = {
             f.split('_')[0]: f
-            for f in os.listdir(f'output/{self.principal_symbol}/extrac_os')
+            for f in os.listdir(f'output/symbol_data/{self.principal_symbol}/extrac_os')
         }
 
         for nodo in self.nodos_close:
 
-            path_is = f'output/{self.principal_symbol}/extrac/{nodo["file"]}'
+            path_is = f'output/symbol_data/{self.principal_symbol}/extrac/{nodo["file"]}'
             file_base = nodo["file"].split('_')[0]
             file_os = FILES_OS_CLOSE[file_base]
-            path_os = f'output/{self.principal_symbol}/extrac_os/{file_os}'
+            path_os = f'output/symbol_data/{self.principal_symbol}/extrac_os/{file_os}'
 
             self.COMBINED[("close", nodo["file"])] = self.build_combined(path_is, path_os)
 
@@ -1092,10 +1068,10 @@ class Backtester:
         for symbol in self.list_symbols:
 
             if symbol == self.principal_symbol:
-                path = f'output/{self.principal_symbol}'
+                path = f'output/symbol_data/{self.principal_symbol}'
                 path_os_root = f'{path}/extrac_os'
             else:
-                path = f'output/{self.principal_symbol}/crossing/{symbol}'
+                path = f'output/symbol_data/{symbol}'
                 path_os_root = f'{path}/extrac_os'
 
             FILES_LOCAL = {
@@ -1638,13 +1614,6 @@ class Backtester:
             "model_data": model_data,
         })
 
-        if self.index < self.min_winning_iteration:
-            print(
-                f"Iteración {self.index}: score preliminar ignorado para ganador; "
-                f"el mejor modelo solo se actualiza desde la iteración {self.min_winning_iteration}."
-            )
-            return preliminary["score"]
-
         if preliminary["score"] > self.best_score:
             self.best_score = preliminary["score"]
             self.no_improve_iterations = 0
@@ -1720,7 +1689,7 @@ class Backtester:
       
 if __name__ == "__main__":
     inn = time.time()
-    backtester = Backtester('AUDCHF', 'Asia', 'DOWN', date_end=None) 
+    backtester = Backtester('AUDCHF', 'Asia', 'DOWN')
     backtester.run()
     print(f'segundos {time.time()-inn}')
     

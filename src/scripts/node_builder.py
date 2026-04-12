@@ -159,7 +159,6 @@ def enrich_with_event_features(indicators_df, prices_df):
 
 
 
-
 def cumple_condiciones(df, condiciones):
     """
     Evalúa condiciones sobre un DataFrame COMPLETO de forma vectorizada.
@@ -196,7 +195,7 @@ def cumple_condiciones(df, condiciones):
     return mascara_final
 
 
-def selecte_nodes(file: str, op_down, op_up, symbol, list_nodos, mercado):
+def selecte_nodes(file: str, op_down, op_up, symbol, list_nodos, mercado, log_q=None):
     """
     Versión optimizada con NumPy/Pandas vectorizado
     """
@@ -204,19 +203,19 @@ def selecte_nodes(file: str, op_down, op_up, symbol, list_nodos, mercado):
     symbolo = file.split('_')[1]
     
     # Cargar DataFrames (una vez)
-    list_dire_indicators_os = os.listdir(f'output/{symbol}/extrac_os')
+    list_dire_indicators_os = os.listdir(f'output/symbol_data/{symbol}/extrac_os')
     dire = next((f for f in list_dire_indicators_os if ext in f), None)
     
     if not dire:
         return
     
     
-    indicators_is = pd.read_parquet(f'output/{symbol}/extrac/{file}')
+    indicators_is = pd.read_parquet(f'output/symbol_data/{symbol}/extrac/{file}')
     # Convertir time a datetime ANTES de slice/copy
     if 'time' in indicators_is.columns and not pd.api.types.is_datetime64_any_dtype(indicators_is['time']):
         indicators_is['time'] = pd.to_datetime(indicators_is['time'])
     
-    df_bas = pd.read_csv(f'output/{symbol}/is_os/is.csv')
+    df_bas = pd.read_csv(f'output/symbol_data/{symbol}/is_os/is.csv')
     # Convertir time a datetime ANTES de slice/copy
     if 'time' in df_bas.columns and not pd.api.types.is_datetime64_any_dtype(df_bas['time']):
         df_bas['time'] = pd.to_datetime(df_bas['time'])
@@ -414,6 +413,8 @@ def selecte_nodes(file: str, op_down, op_up, symbol, list_nodos, mercado):
                 db_query.eliminar_nodo_y_registros(nodo_mas_parecido['node_id']) 
             elif porciento >=config['SimilarityMax'] and nodo_mas_parecido['total_operations'] >= total_is: 
                 print('Mayor pero el de la db mejor')
+                if log_q is not None:
+                    log_q.put('Mayor pero el de la db mejor')
                 continue
         
         # Insertar en DB
@@ -437,17 +438,20 @@ def selecte_nodes(file: str, op_down, op_up, symbol, list_nodos, mercado):
             fechas_os=merged_os['time'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist(),
             veneficios_os=beneficios_netos_os.round(2).tolist()
         )
-        print(
+        msg = (
             f"Nodo insertado: {nodo['label']} - Aciertos IS: {aciertos_is}/{total_is} ({porcentaje_aciertos_is:.2%}) "
             f"- Aciertos OS: {aciertos_os}/{total_os} ({porcentaje_aciertos_os:.2%}) "
             f"- score_is={stats_is['quality_score']:.3f} score_os={stats_os['quality_score']:.3f}"
         )
+        print(msg)
+        if log_q is not None:
+            log_q.put(msg)
         
            
-def procesar_archivo(file: str, symbol, mercado):
+def procesar_archivo(file: str, symbol, mercado, log_q=None):
     try:
-        df = pd.read_parquet(f"output/{symbol}/extrac/{file}")
-        df_bas = pd.read_csv(f'output/{symbol}/is_os/is.csv')
+        df = pd.read_parquet(f"output/symbol_data/{symbol}/extrac/{file}")
+        df_bas = pd.read_csv(f'output/symbol_data/{symbol}/is_os/is.csv')
         if 'time' in df_bas.columns and not pd.api.types.is_datetime64_any_dtype(df_bas['time']):
             df_bas['time'] = pd.to_datetime(df_bas['time'])
         df = enrich_with_event_features(df, df_bas)
@@ -457,7 +461,7 @@ def procesar_archivo(file: str, symbol, mercado):
         operaciones_exitosas_DOWN = 0
         while operaciones_exitosas_UP < config['NumMaxOperations'] or operaciones_exitosas_DOWN < config['NumMaxOperations']:
             list_nodos = node_generator.generar_nodos(100)
-            selecte_nodes(file, operaciones_exitosas_DOWN, operaciones_exitosas_UP, symbol, list_nodos, mercado)
+            selecte_nodes(file, operaciones_exitosas_DOWN, operaciones_exitosas_UP, symbol, list_nodos, mercado, log_q=log_q)
             operaciones_exitosas_UP = db_query.successful_operations_by_label(principal_symbol=symbol, symbol_cruce=symbol, label='UP', mercado=mercado)
             operaciones_exitosas_DOWN = db_query.successful_operations_by_label(principal_symbol=symbol, symbol_cruce=symbol, label='DOWN', mercado=mercado)
     except Exception:
@@ -470,28 +474,26 @@ def procesar_archivo(file: str, symbol, mercado):
         raise
                     
 
-def execute_node_builder(symbol, mercados):  
+def execute_node_builder(symbol, mercados, log_q=None):  
     peticiones.initialize_mt5()
          
-    list_files = os.listdir(f'output/{symbol}/extrac')
-    
-    
-    MAX_PROCESOS = len(list_files)
-    if MAX_PROCESOS > 25:
-        MAX_PROCESOS = 25
-    # Puedes ajustar este número según tu CPU
-    for mercado in mercados:
-        futures = []
+    list_files = os.listdir(f'output/symbol_data/{symbol}/extrac')
 
+    for mercado in mercados:
+        MAX_PROCESOS = int(config.get('use_proces', 25))
+        futures = []
         with ProcessPoolExecutor(max_workers=MAX_PROCESOS) as executor:
-            for file in list_files:
-                future = executor.submit(procesar_archivo, file, symbol, mercado)
+            for i in range(MAX_PROCESOS):
+                indice = i % len(list_files)
+                file = list_files[indice]
+                future = executor.submit(procesar_archivo, file, symbol, mercado, log_q)
                 futures.append(future)
 
             for future in as_completed(futures):
                 try:
                     future.result()
-                except Exception:
+                except Exception as exc:
+                    print(f"Error en proceso hijo durante execute_node_builder: {exc}")
                     logger.exception("Error en proceso hijo durante execute_node_builder")
 
 

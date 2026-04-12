@@ -8,10 +8,19 @@ from dotenv import load_dotenv
 
 
 from src.routes.routes_config import router as router_config
+from src.routes.routes_engine import router as router_engine
 from src.routes import peticiones
+from src import engine_manager
 
 
-app = FastAPI() 
+app = FastAPI()
+
+
+@app.on_event("startup")
+async def startup_event():
+    peticiones.initialize_mt5()
+    engine_manager.start_background_services()
+
 
 
 load_dotenv()
@@ -25,6 +34,7 @@ app.add_middleware(
     allow_headers=["*"],  # Headers permitidos
 )
 app.include_router(router_config, prefix="/config", tags=["Configuracion"])
+app.include_router(router_engine, prefix="/engine", tags=["Engine"])
 
 
 

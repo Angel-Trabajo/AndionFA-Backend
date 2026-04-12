@@ -554,6 +554,7 @@ def get_ranked_nodes(
     order_by="quality_score",
     descending=True,
     limit=50,
+    offset=0,
     min_total_operations=None,
 ):
     ensure_nodes_metrics_columns()
@@ -594,6 +595,12 @@ def get_ranked_nodes(
     cursor = conn.cursor()
     try:
         cursor.execute(
+            f"SELECT COUNT(*) FROM nodes WHERE {where_clause}",
+            tuple(params)
+        )
+        total = cursor.fetchone()[0]
+
+        cursor.execute(
             f"""
             SELECT
                 id,
@@ -624,9 +631,9 @@ def get_ranked_nodes(
             FROM nodes
             WHERE {where_clause}
             ORDER BY {order_by} {direction} NULLS LAST, total_operations DESC
-            LIMIT %s
+            LIMIT %s OFFSET %s
             """,
-            tuple(params + [limit])
+            tuple(params + [limit, offset])
         )
         rows = cursor.fetchall()
     finally:
@@ -659,7 +666,7 @@ def get_ranked_nodes(
         "quality_score_os",
         "max_losing_streak_os",
     ]
-    return [dict(zip(columns, row)) for row in rows]
+    return [dict(zip(columns, row)) for row in rows], total
 
 
 def get_top_quality_nodes(
@@ -668,6 +675,7 @@ def get_top_quality_nodes(
     mercado=None,
     label=None,
     limit=25,
+    offset=0,
     min_total_operations=10,
 ):
     return get_ranked_nodes(
@@ -678,6 +686,7 @@ def get_top_quality_nodes(
         order_by="quality_score",
         descending=True,
         limit=limit,
+        offset=offset,
         min_total_operations=min_total_operations,
     )
 
@@ -688,6 +697,7 @@ def get_top_expectancy_nodes(
     mercado=None,
     label=None,
     limit=25,
+    offset=0,
     min_total_operations=10,
 ):
     return get_ranked_nodes(
@@ -698,6 +708,7 @@ def get_top_expectancy_nodes(
         order_by="expectancy",
         descending=True,
         limit=limit,
+        offset=offset,
         min_total_operations=min_total_operations,
     )
 
@@ -708,6 +719,7 @@ def get_top_profit_factor_nodes(
     mercado=None,
     label=None,
     limit=25,
+    offset=0,
     min_total_operations=10,
 ):
     return get_ranked_nodes(
@@ -718,6 +730,7 @@ def get_top_profit_factor_nodes(
         order_by="profit_factor",
         descending=True,
         limit=limit,
+        offset=offset,
         min_total_operations=min_total_operations,
     )
 
