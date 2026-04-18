@@ -1,10 +1,8 @@
 import os
 import json
-import re
 import sys
 import pandas as pd
 import numpy as np
-import shutil
 from pathlib import Path
 
 sys.path.append(
@@ -59,7 +57,9 @@ def _pearson_binario_simple(df1, df2):
 
       
 def select_symbols_correl(principal_symbol):
-    list_symbol_bruto.remove(principal_symbol)
+    symbols = list_symbol_bruto.copy()
+    if principal_symbol in symbols:
+        symbols.remove(principal_symbol)
     df_os_principal = _create_label(pd.read_csv(f'output/symbol_data/{principal_symbol}/is_os/os.csv'))
     df_is_principal = _create_label(pd.read_csv(f'output/symbol_data/{principal_symbol}/is_os/is.csv'))
     
@@ -69,7 +69,7 @@ def select_symbols_correl(principal_symbol):
     dict_symbol_correl = {}
     
     
-    for i ,symbol in enumerate(list_symbol_bruto):
+    for i ,symbol in enumerate(symbols):
         
         paht_os = Path(f'output/symbol_data/{symbol}/is_os/os.csv')
         paht_is = Path(f'output/symbol_data/{symbol}/is_os/is.csv')
@@ -120,6 +120,11 @@ def select_symbols_correl(principal_symbol):
         if not inserted:
             new_list_symbol.append(symbol)
         
+    max_symbols = 6
+    list_symbol = new_list_symbol[:max_symbols]
+    list_symbol_inversos = [symbol for symbol in list_symbol_inversos if symbol in list_symbol]
+    dict_symbol_correl = {symbol: dict_symbol_correl[symbol] for symbol in list_symbol}
+
     data = {
         "list_symbol": list_symbol,
         "list_symbol_inversos": list_symbol_inversos,

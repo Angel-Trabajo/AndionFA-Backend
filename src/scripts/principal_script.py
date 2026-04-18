@@ -4,18 +4,20 @@ import json
 import operator
 import ast
 import time as time_module
+from datetime import datetime
 import pandas as pd 
 import numpy as np
 import MetaTrader5 as mt5
+from typing import Dict, List
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-from src.routes.peticiones import get_historical_data, get_timeframes, initialize_mt5
+from src.routes.peticiones import get_timeframes, initialize_mt5
 from src.utils.indicadores_for_principal_script import generate_files
 from src.db.query import get_nodes_by_label
 from src.neuronal.entrenar import EXTRA_FEATURE_COLUMNS, load_trained_model, predict_from_inputs, load_data, validate_embedding_vocab
 from src.signals.event_generator import add_event_features, has_entry_event
-from src.utils.common_functions import hora_en_mercado, crear_carpeta_si_no_existe, should_backtest_strategy
+from src.utils.common_functions import hora_en_mercado
 
 
 # =============================================================================
@@ -23,6 +25,11 @@ from src.utils.common_functions import hora_en_mercado, crear_carpeta_si_no_exis
 # =============================================================================
 
 CANDLES_BUFFER = 200  # velas históricas para calcular indicadores (periodo max=80, x2 warmup + margen)
+DEFAULT_LOT_SIZE = 0.01
+
+
+def build_engine_id(symbol: str, mercado: str, algorithm: str) -> str:
+    return f"{symbol}|{mercado}|{algorithm}"
 
 
 class TradingEngine:
@@ -32,10 +39,11 @@ class TradingEngine:
     MT5 gestiona SL/TP de forma nativa.
     """
 
-    def __init__(self, principal_symbol, mercado, algorithm, general_config):
+    def __init__(self, principal_symbol, mercado, algorithm, general_config, lot_size=DEFAULT_LOT_SIZE, strategy_metrics=None):
         self.principal_symbol = principal_symbol
         self.mercado = mercado
         self.algorithm = algorithm
+        self.engine_id = build_engine_id(principal_symbol, mercado, algorithm)
         self.other_algorithm = 'DOWN' if algorithm == 'UP' else 'UP'
         self.general_config = general_config
 
@@ -54,6 +62,11 @@ class TradingEngine:
         self.pip_size = 0.01 if 'JPY' in principal_symbol.upper() else 0.0001
         info = mt5.symbol_info(principal_symbol)
         self.point_size = info.point if info else self.pip_size / 10
+        if info and getattr(info, 'digits', None) is not None and int(info.digits) > 0:
+            self.price_digits = int(info.digits)
+        else:
+            # Fallback seguro: estimar dígitos desde point_size o usar default forex.
+            self.price_digits = int(round(-np.log10(self.point_size))) if self.point_size > 0 else (3 if 'JPY' in principal_symbol.upper() else 5)
 
         # Parámetros de riesgo / cierre (igual que Backtest)
         self.stop_loss = int(general_config.get('stop_loss', 20))
@@ -63,8 +76,30 @@ class TradingEngine:
         self.close_confirmation_bars = 2
         self.close_threshold_floor = 0.60
         self.min_open_symbol_confirmations = int(general_config.get('MinOpenSymbolConfirmations', 4))
-        self.lot_size = float(general_config.get('lot_size', 0.01))
+        self.base_lot_size = float(lot_size)
+        self.last_effective_lot = float(lot_size)
         self.magic = abs(hash(f"{principal_symbol}_{mercado}_{algorithm}")) % 99999 + 1
+        self.strategy_metrics = strategy_metrics or {}
+        self.close_time_decay = float(general_config.get('close_time_decay', 0.0015))
+        self.recent_closed_pips = []
+        self.recent_closed_pips_window = int(general_config.get('equity_window', 20))
+
+        # Control de ejecución live
+        self.active = True
+        self.stop_requested = False
+        self.stop_mode = None
+
+        # Estadísticas live
+        self.stats = {
+            "opened_trades": 0,
+            "closed_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_pips": 0.0,
+            "last_opened_at": None,
+            "last_closed_at": None,
+            "last_close_reason": None,
+        }
 
         self.horas_mercado = [hora_en_mercado(h, mercado) for h in range(24)]
         self.operadores = {
@@ -75,11 +110,9 @@ class TradingEngine:
         # Estado de la operación
         self.is_open = False
         self.ticket = None
-        self.open_price_open = 0.0
         self.entry_red_open = []
         self.cierre = 0
         self.model_close_streak = 0
-        self.time_comienzo = None
         self.current_stop_loss = self.stop_loss
         self.current_take_profit = self.take_profit
 
@@ -89,7 +122,6 @@ class TradingEngine:
         self.prev_row = None          # penúltima vela cerrada ("prev_row" en backtest)
         self.current_forming_time_np = None  # tiempo de la vela en formación
         self.current_forming_hour = 0
-        self.current_open_price = 0.0
 
         self._load()
 
@@ -109,25 +141,25 @@ class TradingEngine:
         # Score / threshold
         score_path = f'output/{self.principal_symbol}/data_for_neuronal/best_score/score_{self.mercado}_{self.algorithm}.json'
         self.close_threshold = self.close_threshold_floor
-        ensemble_model_path = None
         if os.path.exists(score_path):
             with open(score_path) as f:
                 score_data = json.load(f)
             metrics = score_data.get('metrics', {})
-            ensemble_info = metrics.get('ensemble', {})
-            ensemble_model_path = ensemble_info.get('model_path')
+            raw_threshold = metrics.get('best_threshold', self.close_threshold_floor)
+            try:
+                threshold_value = float(raw_threshold)
+            except (TypeError, ValueError):
+                threshold_value = self.close_threshold_floor
             self.close_threshold = max(
-                ensemble_info.get('threshold', metrics.get('best_threshold', 0.5)),
+                threshold_value,
                 self.close_threshold_floor,
             )
 
         # Modelo
-        model_path = ensemble_model_path
-        if not model_path or not os.path.exists(model_path):
-            model_path = f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.pt'
+        model_path = f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.pt'
         data_path = f'output/{self.principal_symbol}/data_for_neuronal/data/data_{self.mercado}_{self.algorithm}.csv'
 
-        input1_ids, input2_ids, hour_ids, X_extra, Y = load_data(data_path)
+        input1_ids, input2_ids, hour_ids, X_extra, _ = load_data(data_path)
         self.nn = load_trained_model(model_path, input_dim_extra=X_extra.shape[1])
         validate_embedding_vocab(self.nn, input1_ids, input2_ids, hour_ids)
 
@@ -227,6 +259,8 @@ class TradingEngine:
         self.current_forming_time_np = np.datetime64(forming['time'])
         self.current_forming_hour = pd.Timestamp(forming['time']).hour
         tick = mt5.symbol_info_tick(self.principal_symbol)
+        if tick is None:
+            return False
         self.current_open_price = tick.ask if self.algorithm == 'UP' else tick.bid
         return True
 
@@ -289,6 +323,9 @@ class TradingEngine:
         positions = mt5.positions_get(ticket=self.ticket)
         return positions[0] if positions else None
 
+    def _round_price(self, value: float) -> float:
+        return float(round(float(value), self.price_digits))
+
     def _check_closed_by_mt5(self):
         """Devuelve (True, pips) si MT5 cerró la posición por SL/TP, sino (False, 0)."""
         if not self.is_open or self.ticket is None:
@@ -307,25 +344,141 @@ class TradingEngine:
                 pips = (xp - ep) / self.pip_size if self.algorithm == 'UP' else (ep - xp) / self.pip_size
         return True, pips
 
+    def update_lot_size(self, lot_size: float):
+        self.base_lot_size = float(lot_size)
+
+    def _normalize_lot_size(self, lot_size: float) -> float:
+        info = mt5.symbol_info(self.principal_symbol)
+        if info is None:
+            return float(round(max(0.01, lot_size), 2))
+
+        min_volume = float(getattr(info, "volume_min", 0.01) or 0.01)
+        max_volume = float(getattr(info, "volume_max", 100.0) or 100.0)
+        step = float(getattr(info, "volume_step", 0.01) or 0.01)
+
+        bounded = max(min_volume, min(max_volume, float(lot_size)))
+        steps = round((bounded - min_volume) / step)
+        normalized = min_volume + steps * step
+        decimals = max(0, len(str(step).split('.')[-1]) if '.' in str(step) else 0)
+        return float(round(normalized, min(decimals, 4)))
+
+    def _compute_dynamic_lot_size(self) -> float:
+        confidence = float(self.strategy_metrics.get("probabilidad", 0.6))
+        confidence = float(np.clip(confidence, 0.5, 0.95))
+
+        profit_factor = float(self.strategy_metrics.get("profit_factor", 1.2))
+        expectancy = float(self.strategy_metrics.get("expectancy", 1.0))
+        stability = ((profit_factor / 2.0) + (max(expectancy, 0.0) / 10.0)) / 2.0
+        stability = float(np.clip(stability, 0.5, 1.5))
+
+        equity_factor = 1.0
+        if len(self.recent_closed_pips) >= 10:
+            recent = np.asarray(self.recent_closed_pips[-self.recent_closed_pips_window:], dtype=np.float64)
+            equity_curve = recent.cumsum()
+            current_equity = float(equity_curve[-1])
+            avg_equity = float(equity_curve.mean())
+            if current_equity < avg_equity:
+                equity_factor = 0.7
+
+        raw_lot = self.base_lot_size * confidence * stability * equity_factor
+        return self._normalize_lot_size(raw_lot)
+
+    def request_stop(self, mode: str):
+        if mode not in {"graceful", "immediate"}:
+            raise ValueError("mode debe ser graceful o immediate")
+
+        if not self.active and not self.is_open:
+            self.stop_requested = True
+            self.stop_mode = mode
+            return "already_stopped"
+
+        if self.stop_requested and self.stop_mode == mode:
+            return "already_requested"
+
+        self.stop_requested = True
+        self.stop_mode = mode
+
+        # Si no hay operación, se desactiva al momento.
+        if not self.is_open:
+            self.active = False
+            return "stopped_now"
+
+        if mode == "immediate" and self.is_open:
+            closed, pips = self._close_trade()
+            if closed:
+                self._record_close(pips, "manual_immediate")
+                self._reset_state()
+            self.active = False
+            return "stopped_immediate"
+
+        return "pending_close"
+
+    def _record_open(self):
+        self.stats["opened_trades"] += 1
+        self.stats["last_opened_at"] = datetime.utcnow().isoformat()
+
+    def _record_close(self, pips: float, reason: str):
+        self.stats["closed_trades"] += 1
+        self.stats["total_pips"] += float(pips)
+        if pips >= 0:
+            self.stats["wins"] += 1
+        else:
+            self.stats["losses"] += 1
+        self.stats["last_closed_at"] = datetime.utcnow().isoformat()
+        self.stats["last_close_reason"] = reason
+        self.recent_closed_pips.append(float(pips))
+        if len(self.recent_closed_pips) > self.recent_closed_pips_window:
+            self.recent_closed_pips = self.recent_closed_pips[-self.recent_closed_pips_window:]
+
+    def status_payload(self):
+        closed_trades = self.stats["closed_trades"]
+        winrate = (self.stats["wins"] / closed_trades) if closed_trades else 0.0
+        if self.stop_requested and self.stop_mode == "graceful" and self.is_open:
+            runtime_state = "pending_close"
+        elif not self.active:
+            runtime_state = "inactive"
+        else:
+            runtime_state = "active"
+
+        return {
+            "engine_id": self.engine_id,
+            "symbol": self.principal_symbol,
+            "mercado": self.mercado,
+            "algo": self.algorithm,
+            "is_open": self.is_open,
+            "active": self.active,
+            "stop_requested": self.stop_requested,
+            "stop_mode": self.stop_mode,
+            "runtime_state": runtime_state,
+            "lot_size": self.base_lot_size,
+            "effective_lot": self.last_effective_lot,
+            "stats": {
+                **self.stats,
+                "winrate": winrate,
+            },
+        }
+
     def _open_trade(self):
         tick = mt5.symbol_info_tick(self.principal_symbol)
         if tick is None:
             return None
         if self.algorithm == 'UP':
             price = tick.ask
-            sl = round(price - self.current_stop_loss * self.pip_size, 5)
-            tp = round(price + self.current_take_profit * self.pip_size, 5)
+            sl = self._round_price(price - self.current_stop_loss * self.pip_size)
+            tp = self._round_price(price + self.current_take_profit * self.pip_size)
             order_type = mt5.ORDER_TYPE_BUY
         else:
             price = tick.bid
-            sl = round(price + self.current_stop_loss * self.pip_size, 5)
-            tp = round(price - self.current_take_profit * self.pip_size, 5)
+            sl = self._round_price(price + self.current_stop_loss * self.pip_size)
+            tp = self._round_price(price - self.current_take_profit * self.pip_size)
             order_type = mt5.ORDER_TYPE_SELL
 
+        effective_lot = self._compute_dynamic_lot_size()
+        self.last_effective_lot = effective_lot
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": self.principal_symbol,
-            "volume": self.lot_size,
+            "volume": effective_lot,
             "type": order_type,
             "price": price,
             "sl": sl,
@@ -337,8 +490,12 @@ class TradingEngine:
             "type_filling": self._get_filling_mode(),
         }
         result = mt5.order_send(request)
+        if result is None:
+            print(f"  ❌ Error apertura {self.principal_symbol}/{self.mercado}/{self.algorithm}: sin respuesta de MT5")
+            return None
         if result.retcode == mt5.TRADE_RETCODE_DONE:
-            print(f"  ✅ OPEN {self.algorithm} {self.principal_symbol}/{self.mercado} @ {price} SL={sl} TP={tp} ticket={result.order}")
+            print(f"  ✅ OPEN {self.algorithm} {self.principal_symbol}/{self.mercado} @ {price} lot={effective_lot} SL={sl} TP={tp} ticket={result.order}")
+            self._record_open()
             return result.order
         print(f"  ❌ Error apertura {self.principal_symbol}/{self.mercado}/{self.algorithm}: {result.retcode} - {result.comment}")
         return None
@@ -346,16 +503,18 @@ class TradingEngine:
     def _close_trade(self):
         position = self._get_position()
         if position is None:
-            return False
+            return False, 0.0
         tick = mt5.symbol_info_tick(self.principal_symbol)
         if tick is None:
-            return False
+            return False, 0.0
         if self.algorithm == 'UP':
             order_type = mt5.ORDER_TYPE_SELL
             price = tick.bid
+            pips = (price - position.price_open) / self.pip_size
         else:
             order_type = mt5.ORDER_TYPE_BUY
             price = tick.ask
+            pips = (position.price_open - price) / self.pip_size
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": self.principal_symbol,
@@ -370,26 +529,34 @@ class TradingEngine:
             "type_filling": self._get_filling_mode(),
         }
         result = mt5.order_send(request)
+        if result is None:
+            print(f"  ❌ Error cierre {self.principal_symbol}/{self.mercado}/{self.algorithm}: sin respuesta de MT5")
+            return False, 0.0
         if result.retcode == mt5.TRADE_RETCODE_DONE:
             print(f"  ✅ CLOSE {self.algorithm} {self.principal_symbol}/{self.mercado} @ {price}")
-            return True
+            return True, pips
         print(f"  ❌ Error cierre {self.principal_symbol}/{self.mercado}/{self.algorithm}: {result.retcode} - {result.comment}")
-        return False
+        return False, 0.0
 
     def _reset_state(self):
         self.is_open = False
         self.ticket = None
-        self.open_price_open = 0.0
         self.entry_red_open = []
         self.cierre = 0
         self.model_close_streak = 0
-        self.time_comienzo = None
 
     # ------------------------------------------------------------------
     # Procesamiento de nueva vela (lógica idéntica a test_iteration)
     # ------------------------------------------------------------------
 
     def process(self, shared_indicators):
+        if not self.active:
+            return
+
+        if self.stop_requested and not self.is_open:
+            self.active = False
+            return
+
         if not self.apply_shared_indicators(shared_indicators):
             print(f"  ⚠️ [{self.principal_symbol}/{self.mercado}/{self.algorithm}] Error aplicando indicadores.")
             return
@@ -410,14 +577,21 @@ class TradingEngine:
             closed_by_mt5, pips = self._check_closed_by_mt5()
             if closed_by_mt5:
                 print(f"  [{self.principal_symbol}/{self.mercado}/{self.algorithm}] Cerrado por MT5: {pips:.1f} pips tras {self.cierre} barras")
+                self._record_close(pips, "mt5")
                 self._reset_state()
+                if self.stop_requested:
+                    self.active = False
                 return
 
             # 2. Max holding
             if self.cierre >= self.max_holding:
-                if self._close_trade():
+                closed, pips = self._close_trade()
+                if closed:
                     print(f"  [{self.principal_symbol}/{self.mercado}/{self.algorithm}] Cerrado por max_holding")
+                    self._record_close(pips, "max_holding")
                     self._reset_state()
+                    if self.stop_requested:
+                        self.active = False
                 return
 
             # 3. Cierre por modelo neuronal (con confirmación de barras)
@@ -437,7 +611,9 @@ class TradingEngine:
                             continue
                         for entry in self.entry_red_open:
                             prob = predict_from_inputs(self.nn, entry, nodo_close, hour, market_features)
-                            if prob > self.close_threshold:
+                            decay = self.close_time_decay * max(self.cierre - self.min_model_holding, 0)
+                            effective_prob = prob - decay
+                            if effective_prob > self.close_threshold:
                                 model_signal = True
                                 break
                         if model_signal:
@@ -446,12 +622,20 @@ class TradingEngine:
                 self.model_close_streak = self.model_close_streak + 1 if model_signal else 0
 
                 if self.model_close_streak >= self.close_confirmation_bars:
-                    if self._close_trade():
+                    closed, pips = self._close_trade()
+                    if closed:
                         print(f"  [{self.principal_symbol}/{self.mercado}/{self.algorithm}] Cerrado por modelo tras {self.cierre} barras")
+                        self._record_close(pips, "model")
                         self._reset_state()
+                        if self.stop_requested:
+                            self.active = False
 
         # ── SIN POSICIÓN ──────────────────────────────────────────────
         else:
+            if self.stop_requested:
+                self.active = False
+                return
+
             self.cierre = 0
             self.model_close_streak = 0
 
@@ -472,11 +656,9 @@ class TradingEngine:
             if ticket is not None:
                 self.is_open = True
                 self.ticket = ticket
-                self.open_price_open = self.current_open_price
                 self.entry_red_open = open_nodes
                 self.cierre = 0
                 self.model_close_streak = 0
-                self.time_comienzo = pd.Timestamp(self.current_forming_time_np.item())
 
 
 class TradingServer:
@@ -485,46 +667,99 @@ class TradingServer:
     y los ejecuta en tiempo real esperando nuevas velas.
     """
 
-    def __init__(self):
+    def __init__(self, filtered_algorithms: List[dict] | None = None, lot_sizes: Dict[str, float] | None = None):
         initialize_mt5()
         with open('config/general_config.json', 'r', encoding='utf-8') as f:
             self.general_config = json.load(f)
 
+        self.filtered_algorithms = filtered_algorithms or []
+        self.lot_sizes = lot_sizes or {}
         self.timeframe = get_timeframes()['timeframes'][self.general_config['timeframe']]
         self.engines: list = []
+        self.engines_by_id: Dict[str, TradingEngine] = {}
         self._last_candle_time = None
         self._running = False
+        self._stop_when_all_inactive = False
         self._build_engines()
 
     def _build_engines(self):
         print("Cargando estrategias activas...\n")
-        list_principal_symbols = self.general_config['list_principal_symbols']
-        list_mercados = ['Asia', 'Europa', 'America']
-        list_algorithms = ['UP', 'DOWN']
+        load_errors_summary = {}
+        for item in self.filtered_algorithms:
+            principal_symbol = item.get("symbol")
+            mercado = item.get("mercado")
+            algorithm = item.get("algorithm")
+            if not principal_symbol or not mercado or not algorithm:
+                continue
 
-        for principal_symbol in list_principal_symbols:
-            for mercado in list_mercados:
-                for algorithm in list_algorithms:
-                    score_path = (
-                        f'output/{principal_symbol}/data_for_neuronal/'
-                        f'best_score/score_{mercado}_{algorithm}.json'
-                    )
-                    if not os.path.exists(score_path):
-                        continue
-                    with open(score_path) as f:
-                        score_data = json.load(f)
-                    metrics = score_data.get('metrics', {})
-                    if not should_backtest_strategy(metrics):
-                        print(f"  ⏭  {principal_symbol}/{mercado}/{algorithm} no pasa el filtro")
-                        continue
-                    try:
-                        engine = TradingEngine(principal_symbol, mercado, algorithm, self.general_config)
-                        self.engines.append(engine)
-                        print(f"  ✅ {principal_symbol}/{mercado}/{algorithm} cargado")
-                    except Exception as e:
-                        print(f"  ❌ {principal_symbol}/{mercado}/{algorithm} error al cargar: {e}")
+            engine_id = build_engine_id(principal_symbol, mercado, algorithm)
+            lot_size = float(self.lot_sizes.get(engine_id, item.get("lot_size", DEFAULT_LOT_SIZE)))
+            try:
+                engine = TradingEngine(
+                    principal_symbol,
+                    mercado,
+                    algorithm,
+                    self.general_config,
+                    lot_size=lot_size,
+                    strategy_metrics=item.get("metrics", {}),
+                )
+                self.engines.append(engine)
+                self.engines_by_id[engine.engine_id] = engine
+                print(f"  ✅ {engine_id} cargado (lot_size={lot_size})")
+            except Exception as e:
+                err_msg = str(e).strip()
+                first_line = err_msg.splitlines()[0] if err_msg else "error desconocido"
+                if "size mismatch" in err_msg:
+                    first_line = "size mismatch en pesos del modelo (arquitectura distinta)"
+                load_errors_summary[first_line] = load_errors_summary.get(first_line, 0) + 1
+                print(f"  ❌ {engine_id} error al cargar: {first_line}")
+
+        if load_errors_summary:
+            print("\nResumen de errores de carga:")
+            for reason, count in load_errors_summary.items():
+                print(f"  - {count}x {reason}")
 
         print(f"\n{len(self.engines)} estrategias activas.\n")
+
+    def update_engine_lot_size(self, engine_id: str, lot_size: float):
+        engine = self.engines_by_id.get(engine_id)
+        if engine is None:
+            return False
+        engine.update_lot_size(lot_size)
+        return True
+
+    def stop_engine(self, engine_id: str, mode: str):
+        engine = self.engines_by_id.get(engine_id)
+        if engine is None:
+            return {"status": "not_found", "engine_id": engine_id}
+        stop_result = engine.request_stop(mode)
+        return {
+            "status": "ok" if stop_result in {"pending_close", "stopped_now", "stopped_immediate", "already_stopped", "already_requested"} else stop_result,
+            "engine_id": engine_id,
+            "mode": mode,
+            "result": stop_result,
+            "runtime_state": engine.status_payload().get("runtime_state"),
+        }
+
+    def collect_stats(self):
+        engines_payload = [engine.status_payload() for engine in self.engines]
+        total_opened = sum(e["stats"]["opened_trades"] for e in engines_payload)
+        total_closed = sum(e["stats"]["closed_trades"] for e in engines_payload)
+        total_wins = sum(e["stats"]["wins"] for e in engines_payload)
+        total_losses = sum(e["stats"]["losses"] for e in engines_payload)
+        total_pips = sum(e["stats"]["total_pips"] for e in engines_payload)
+        collective = {
+            "total_engines": len(engines_payload),
+            "active_engines": sum(1 for e in engines_payload if e["active"]),
+            "open_positions": sum(1 for e in engines_payload if e["is_open"]),
+            "opened_trades": total_opened,
+            "closed_trades": total_closed,
+            "wins": total_wins,
+            "losses": total_losses,
+            "winrate": (total_wins / total_closed) if total_closed else 0.0,
+            "total_pips": total_pips,
+        }
+        return {"collective": collective, "engines": engines_payload}
 
     def _fetch_shared_indicators(self):
         """
@@ -570,8 +805,26 @@ class TradingServer:
         print(f"  ⏱  Indicadores calculados ({len(all_symbols)} símbolos únicos) en {elapsed:.2f}s")
         return shared_indicators
 
-    def stop(self):
-        self._running = False
+    def stop(self, mode: str = "graceful"):
+        if mode not in {"graceful", "immediate"}:
+            raise ValueError("mode debe ser graceful o immediate")
+
+        self._stop_mode = mode
+        if mode == "immediate":
+            for engine in self.engines:
+                if engine.active:
+                    engine.request_stop("immediate")
+            self._running = False
+            return
+
+        # graceful: no abrir más y esperar cierre natural de las abiertas
+        for engine in self.engines:
+            if engine.active:
+                engine.request_stop("graceful")
+        self._stop_when_all_inactive = True
+
+    def _all_engines_inactive(self) -> bool:
+        return all(not e.active for e in self.engines)
 
     def _wait_for_new_candle(self):
         """Bloquea hasta que se forma una nueva vela (timeframe compartido)."""
@@ -583,13 +836,13 @@ class TradingServer:
         # Inicializar referencia si es la primera vez
         if self._last_candle_time is None:
             rates = mt5.copy_rates_from_pos(ref_symbol, self.timeframe, 0, 2)
-            if rates is not None:
+            if rates is not None and len(rates) >= 2:
                 self._last_candle_time = rates[-2]['time']  # última vela cerrada
 
         while self._running:
             time_module.sleep(5)
             rates = mt5.copy_rates_from_pos(ref_symbol, self.timeframe, 0, 2)
-            if rates is None:
+            if rates is None or len(rates) < 2:
                 continue
             new_time = rates[-2]['time']  # última vela cerrada
             if new_time != self._last_candle_time:
@@ -601,7 +854,14 @@ class TradingServer:
         self._running = True
         print("TradingServer activo. Esperando nueva vela...\n")
         while self._running:
+            if self._stop_when_all_inactive and self._all_engines_inactive():
+                print("Todos los engines están inactivos. Parada graceful completada.")
+                self._running = False
+                break
+
             self._wait_for_new_candle()
+            if not self._running:
+                break
             t_start = time_module.perf_counter()
             print(f"[{_dt.now().strftime('%Y-%m-%d %H:%M:%S')}] Nueva vela. Procesando {len(self.engines)} engines...")
             shared_indicators = self._fetch_shared_indicators()

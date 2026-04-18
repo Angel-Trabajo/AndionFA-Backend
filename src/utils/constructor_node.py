@@ -1,7 +1,5 @@
 import numpy as np
 import random
-import pandas as pd
-import time
 
 
 class NodeGenerator:
@@ -42,10 +40,25 @@ class NodeGenerator:
             axis=0
         )
 
+        # Peso por feature: prioriza variables con mayor varianza efectiva.
+        feature_std = np.nanstd(self.data, axis=0)
+        finite_mask = np.isfinite(feature_std)
+        safe_std = np.where(finite_mask, feature_std, 0.0)
+        safe_std = np.maximum(safe_std, 1e-6)
+        self.feature_weights = (safe_std / safe_std.sum()).astype(np.float64)
+
+    def _sample_feature_idx(self):
+        if self.n_features == 0:
+            raise ValueError("No hay features disponibles para generar nodos")
+        # Si por algún motivo los pesos no son válidos, fallback uniforme.
+        if not np.isfinite(self.feature_weights).all() or self.feature_weights.sum() <= 0:
+            return random.randrange(self.n_features)
+        return int(np.random.choice(self.n_features, p=self.feature_weights))
+
     # ---------- generar condicion ----------
     def _generar_condicion(self):
 
-        idx = random.randrange(self.n_features)
+        idx = self._sample_feature_idx()
         if idx in self.binary_feature_idx:
             return (idx, 2, 1.0)
 
@@ -93,6 +106,7 @@ class NodeGenerator:
 
         return {
             "label": self.unique_labels[label_idx],
+            "num_conditions": int(num_cond),
             "conditions": [
                 (self.features[i], "<" if op == 0 else ("==" if op == 2 else ">="), v)
                 for i, op, v in condiciones

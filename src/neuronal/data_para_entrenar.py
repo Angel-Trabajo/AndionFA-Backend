@@ -6,8 +6,6 @@ import sys
 import ast
 import os
 import json
-import numpy as np
-import ast
 import operator
 import pandas as pd
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))

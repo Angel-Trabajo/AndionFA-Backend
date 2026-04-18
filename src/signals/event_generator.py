@@ -29,7 +29,6 @@ def add_event_features(df):
     high = _as_float_series(enriched, "high")
     low = _as_float_series(enriched, "low")
     open_price = _as_float_series(enriched, "open")
-    ret_1 = _as_float_series(enriched, "ret_1", default=(close - open_price))
     ret_3 = _as_float_series(enriched, "ret_3", default=(close - close.shift(3)))
     ret_10 = _as_float_series(enriched, "ret_10", default=(close - close.shift(10)))
     ma_5 = _as_float_series(enriched, "ma_5", default=close.rolling(5).mean())

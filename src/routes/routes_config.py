@@ -1,21 +1,21 @@
 import os, sys
 import json
 import shutil
-import sqlite3
+
 import subprocess
 import psutil
-import asyncio
+
 import threading
-from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from pathlib import Path
 import time
-import concurrent.futures
+
 import multiprocessing
 from datetime import datetime
 
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Query, WebSocket, WebSocketDisconnect, UploadFile, File, Body
-from typing import List
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Body
 
 from src.routes import peticiones 
 from ..models.indicators import ConfigRequest, ExecuteRequest
@@ -23,7 +23,7 @@ from src.scripts.create_indicators import create_files
 from src.scripts.node_builder import execute_node_builder
 from src.scripts.crossing_builder_cpu import execute_crossing_builder
 from dotenv import load_dotenv
-from src.utils.common_functions import crear_carpeta_si_no_existe, get_previous_4_6, should_backtest_strategy
+from src.utils.common_functions import crear_carpeta_si_no_existe, get_previous_4_6
 from src.neuronal.data_para_entrenar import execute_data_for_neuronal
 from src.neuronal.entrenar import execute_entrenar
 from src.neuronal.backtester import Backtester
@@ -42,20 +42,12 @@ _backtest_run_state = {
 
 load_dotenv()
 
-PYTHON_PATH = os.getenv("PYTHON_PATH")  
-SCRIPT_PATH = os.getenv("SCRIPT_PATH")
-SCRIPT_PATH_CROSS = os.getenv("SCRIPT_PATH_CROSS")
-SCRIPT_PATH_CROSS_F = os.getenv("SCRIPT_PATH_CROSS_F")
-
 PATH_GENERAL_CONFIG = 'config/general_config.json'
 PATH_BACKTEST_CONFIG = 'config/backtest_config.json'
 PATH_EXTRACTOR = 'config/extractor'
 
 
 router = APIRouter()
-process = None
-process2 = None
-connected_clients: List[WebSocket] = []
 
 # ── Execute state ──────────────────────────────────────────────────────────
 # El algoritmo corre en un proceso separado para poder matarlo inmediatamente.
@@ -100,20 +92,6 @@ def _is_symbol_done(symbol: str, list_mercado: list, list_algorithms: list) -> b
     )
 
 
-def _run_backtester(args: tuple[str, str, str]) -> list[str]:
-    import io, sys
-    buf = io.StringIO()
-    sys.stdout = sys.stderr = buf
-    try:
-        symbol, mercado, algorithm = args
-        backtester = Backtester(symbol, mercado, algorithm)
-        backtester.run()
-    finally:
-        sys.stdout = sys.__stdout__
-        sys.stderr = sys.__stderr__
-    return [line for line in buf.getvalue().splitlines() if line.strip()]
-
-
 def _run_backtest_script_worker() -> None:
     try:
         backend_root = Path(__file__).resolve().parents[2]
@@ -126,10 +104,33 @@ def _run_backtest_script_worker() -> None:
             capture_output=True,
             check=False,
         )
-        if completed.stdout:
-            print(completed.stdout)
-        if completed.stderr:
-            print(completed.stderr)
+        logs_dir = backend_root / BACKTEST_RESULTS_DIR
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        log_file = logs_dir / 'backtest_last.log'
+
+        stdout_text = completed.stdout or ""
+        stderr_text = completed.stderr or ""
+
+        with open(log_file, 'w', encoding='utf8') as f:
+            if stdout_text:
+                f.write("=== STDOUT ===\n")
+                f.write(stdout_text)
+                if not stdout_text.endswith("\n"):
+                    f.write("\n")
+            if stderr_text:
+                f.write("=== STDERR ===\n")
+                f.write(stderr_text)
+
+        print(f"Backtest finalizado con código {completed.returncode}. Log completo: {log_file}")
+
+        if completed.returncode != 0:
+            stderr_lines = [ln for ln in stderr_text.splitlines() if ln.strip()]
+            tail = stderr_lines[-5:] if stderr_lines else []
+            if tail:
+                print("Últimas líneas de error:")
+                for line in tail:
+                    print(line)
+
         if completed.returncode != 0:
             raise RuntimeError(f"backtest.py finalizó con código {completed.returncode}")
         _backtest_run_state["last_error"] = None
@@ -183,7 +184,7 @@ async def extractor_file():
 
 
 @router.post('/extractor-files')
-async def extractor_file(request: list[str]):
+async def extractor_file_post(request: list[str]):
     with open(PATH_GENERAL_CONFIG, 'r', encoding='utf8') as file:
         data = json.load(file)
     data['indicators_files'] = request
@@ -228,7 +229,6 @@ async def postnode_config(request: ConfigRequest):
     config["ProgressiveVariation"] = request.ProgressiveVariation
     config["MinOpenSymbolConfirmations"] = request.MinOpenSymbolConfirmations
     config["robust_trade_penalty_center"] = request.robust_trade_penalty_center
-    config["lot_size"] = request.lot_size
     config["stop_loss"] = request.stop_loss
     config["take_profit"] = request.take_profit
     config["use_proces"] = request.use_proces
@@ -245,7 +245,7 @@ async def postnode_config(request: ConfigRequest):
 
 @router.post("/execute-algorithm")
 def execute_algorithm(request: ExecuteRequest):
-    global _algo_process
+    global _algo_process, _logs_offset
     if _algo_process and _algo_process.is_alive():
         return {"status": "already_running"}
     # Vaciar cola y logs de la ejecución anterior
@@ -354,9 +354,11 @@ def _run_algorithm(reset_db: bool, q: multiprocessing.Queue):
     report(running=True, total=0, done=0, current=None, step=None)
     ini = time.time()
 
+    print("Inicio de ejecución: limpiando carpeta output...")
+    _clear_directory_contents(Path("output"))
+
     if reset_db:
-        print("reset_db=true: limpiando carpetas output y config/divisas...")
-        _clear_directory_contents(Path("output"))
+        print("reset_db=true: limpiando config/divisas y reseteando base de datos...")
         _clear_directory_contents(Path("config/divisas"))
         reset_database()
 
@@ -366,6 +368,7 @@ def _run_algorithm(reset_db: bool, q: multiprocessing.Queue):
     list_mercado = ['Asia', 'Europa', 'America']
     list_algorithms = ['UP', 'DOWN']
     list_principal_symbols = config['list_principal_symbols']
+    max_backtest_workers = int(config.get('backtest_parallel_workers', 3))
     timeframe = config['timeframe']
     date_start_os = config['dateStart']
     date_end_os = config['dateEnd']
@@ -422,16 +425,26 @@ def _run_algorithm(reset_db: bool, q: multiprocessing.Queue):
 
         report(step="backtest")
         print(f"[{done + 1}/{total}] {symbol} — backtest...")
-        for mercado_t in list_mercado:
-            for algorithm_t in list_algorithms:
+        backtest_jobs = [(mercado_t, algorithm_t) for mercado_t in list_mercado for algorithm_t in list_algorithms]
+        workers = max(1, min(max_backtest_workers, len(backtest_jobs)))
+
+        def _run_single_backtest(job):
+            mercado_t, algorithm_t = job
+            print(f"Backtest: {symbol} {mercado_t} {algorithm_t}...")
+            backtester = Backtester(symbol, mercado_t, algorithm_t)
+            backtester.run()
+            return mercado_t, algorithm_t
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {executor.submit(_run_single_backtest, job): job for job in backtest_jobs}
+            for future in as_completed(future_map):
+                mercado_t, algorithm_t = future_map[future]
                 try:
-                    print(f"Backtest: {symbol} {mercado_t} {algorithm_t}...")
-                    backtester = Backtester(symbol, mercado_t, algorithm_t)
-                    backtester.run()
+                    future.result()
                 except ValueError as exc:
-                    print(f"Backtester omitido por datos insuficientes: {exc}")
+                    print(f"Backtester omitido por datos insuficientes [{symbol} {mercado_t} {algorithm_t}]: {exc}")
                 except Exception as exc:
-                    print(f"Error en backtester: {exc}")
+                    print(f"Error en backtester [{symbol} {mercado_t} {algorithm_t}]: {exc}")
 
         done += 1
         report(done=done, step=None)
@@ -504,6 +517,11 @@ def backtest_config_post(payload: dict = Body(...)):
 def backtest_run():
     if _backtest_run_state["running"]:
         return {"status": "running", "detail": "Backtest ya está en ejecución"}
+
+    try:
+        _clear_directory_contents(Path(BACKTEST_RESULTS_DIR))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"No se pudo limpiar {BACKTEST_RESULTS_DIR}: {exc}")
 
     _backtest_run_state["running"] = True
     _backtest_run_state["last_error"] = None
@@ -617,7 +635,7 @@ def nodes_list(
     page: int = Query(1, ge=1),
     min_ops: int = Query(5, ge=0),
 ):
-    page_size = 50
+    page_size = 20
     offset = (page - 1) * page_size
     try:
         rows, total = get_top_quality_nodes(

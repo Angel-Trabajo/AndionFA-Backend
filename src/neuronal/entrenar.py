@@ -8,23 +8,16 @@ import torch.nn as nn
 import torch.optim as optim
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from src.utils.common_functions import crear_carpeta_si_no_existe
-from src.signals.event_generator import EVENT_FEATURE_COLUMNS
 
 
 EXTRA_FEATURE_COLUMNS = [
     "ret_1",
     "range_1",
     "trend",
-    "vol",
-    "ret_3",
-    "ret_10",
-    "trend_10",
-    "trend_20",
     "vol_10",
-    "vol_20",
     "zscore_20",
     "momentum_ratio",
-] + EVENT_FEATURE_COLUMNS
+]
 
 OPEN_NODE_BITS = 8
 CLOSE_NODE_BITS = 8
@@ -50,6 +43,20 @@ def _extract_extra_features(row):
         float(row[column]) if column in row else 0.0
         for column in EXTRA_FEATURE_COLUMNS
     ], dtype=np.float32)
+
+
+def _binary_id_to_bit_array(value, width):
+    bit_positions = np.arange(width - 1, -1, -1, dtype=np.int64)
+    return ((int(value) >> bit_positions) & 1).astype(np.float32)
+
+
+def _augment_extra_features(input1_id, input2_id, extra_features):
+    extra = np.asarray(extra_features, dtype=np.float32).reshape(-1)
+    return np.concatenate([
+        extra,
+        _binary_id_to_bit_array(input1_id, OPEN_NODE_BITS),
+        _binary_id_to_bit_array(input2_id, CLOSE_NODE_BITS),
+    ]).astype(np.float32)
 
 
 def get_embedding_vocab_sizes(input1_ids, input2_ids, hour_ids):
@@ -128,12 +135,14 @@ class BinaryNN(nn.Module):
         num_open=256,
         num_close=256,
         num_hours=32,
-        emb_open_dim=8,
-        emb_close_dim=8,
-        emb_hour_dim=4,
+        emb_open_dim=4,
+        emb_close_dim=4,
+        emb_hour_dim=3,
         dropout_rate=0.20,
         weight_decay=1e-4,
         false_positive_cost_ratio=2.0,
+        hidden_dim_1=48,
+        hidden_dim_2=24,
         lr=0.001,
         target_loss=0.10,
     ):
@@ -152,6 +161,8 @@ class BinaryNN(nn.Module):
         self.dropout_rate = dropout_rate
         self.weight_decay = weight_decay
         self.false_positive_cost_ratio = false_positive_cost_ratio
+        self.hidden_dim_1 = int(hidden_dim_1)
+        self.hidden_dim_2 = int(hidden_dim_2)
         self.feature_mean = None
         self.feature_std = None
         self.device = _get_device()
@@ -161,11 +172,11 @@ class BinaryNN(nn.Module):
         self.dropout = nn.Dropout(dropout_rate)
         total_input = emb_open_dim + emb_close_dim + emb_open_dim + emb_hour_dim + input_dim_extra
         self.logits_model = nn.Sequential(
-            nn.Linear(total_input, 64),
+            nn.Linear(total_input, self.hidden_dim_1),
             nn.ReLU(),
-            nn.Linear(64, 32),
+            nn.Linear(self.hidden_dim_1, self.hidden_dim_2),
             nn.ReLU(),
-            nn.Linear(32, 1),
+            nn.Linear(self.hidden_dim_2, 1),
         )
         self.to(self.device)
 
@@ -353,6 +364,8 @@ def save_trained_model(model, model_file):
             "emb_open_dim": model.emb_open_dim,
             "emb_close_dim": model.emb_close_dim,
             "emb_hour_dim": model.emb_hour_dim,
+            "hidden_dim_1": int(getattr(model, "hidden_dim_1", 48)),
+            "hidden_dim_2": int(getattr(model, "hidden_dim_2", 24)),
             "dropout_rate": model.dropout_rate,
             "weight_decay": model.weight_decay,
             "false_positive_cost_ratio": model.false_positive_cost_ratio,
@@ -364,47 +377,35 @@ def save_trained_model(model, model_file):
     )
 
 
-def save_ensemble_model(model_entries, model_file):
-    serialized_models = []
-    for entry in model_entries:
-        model_data = entry["model_data"]
-        serialized_models.append(
-            {
-                "model_type": model_data.get("model_type", "embedding"),
-                "input_dim_extra": model_data["input_dim_extra"],
-                "num_open": model_data["num_open"],
-                "num_close": model_data["num_close"],
-                "num_hours": model_data["num_hours"],
-                "emb_open_dim": model_data["emb_open_dim"],
-                "emb_close_dim": model_data["emb_close_dim"],
-                "emb_hour_dim": model_data["emb_hour_dim"],
-                "dropout_rate": model_data["dropout_rate"],
-                "weight_decay": model_data["weight_decay"],
-                "false_positive_cost_ratio": model_data.get("false_positive_cost_ratio", 2.0),
-                "state_dict": model_data["state_dict"],
-                "feature_mean": model_data.get("feature_mean"),
-                "feature_std": model_data.get("feature_std"),
-                "iteration": entry.get("iteration"),
-                "score": entry.get("score"),
-            }
-        )
-
-    torch.save(
-        {
-            "model_type": "ensemble",
-            "models": serialized_models,
-            "weights": [float(entry["weight"]) for entry in model_entries],
-            "top_k": len(serialized_models),
-        },
-        model_file,
-    )
-
-
 def _build_embedding_model_from_checkpoint(checkpoint, input_dim_extra=None, lr=0.001):
     resolved_input_dim_extra = checkpoint.get("input_dim_extra", input_dim_extra)
     if resolved_input_dim_extra is None:
         feature_mean = checkpoint.get("feature_mean")
         resolved_input_dim_extra = len(feature_mean) if feature_mean is not None else len(EXTRA_FEATURE_COLUMNS)
+
+    state_dict = checkpoint.get("state_dict", checkpoint)
+
+    def _get_hidden_dims_from_state(sd):
+        # Compatibilidad hacia atras: inferir arquitectura desde pesos guardados.
+        h1 = checkpoint.get("hidden_dim_1")
+        h2 = checkpoint.get("hidden_dim_2")
+        if h1 is None:
+            if "logits_model.0.weight" in sd:
+                h1 = int(sd["logits_model.0.weight"].shape[0])
+            elif "model.0.weight" in sd:
+                h1 = int(sd["model.0.weight"].shape[0])
+            else:
+                h1 = 48
+        if h2 is None:
+            if "logits_model.2.weight" in sd:
+                h2 = int(sd["logits_model.2.weight"].shape[0])
+            elif "model.2.weight" in sd:
+                h2 = int(sd["model.2.weight"].shape[0])
+            else:
+                h2 = 24
+        return int(h1), int(h2)
+
+    hidden_dim_1, hidden_dim_2 = _get_hidden_dims_from_state(state_dict)
 
     nn_model = BinaryNN(
         input_dim_extra=resolved_input_dim_extra,
@@ -414,12 +415,14 @@ def _build_embedding_model_from_checkpoint(checkpoint, input_dim_extra=None, lr=
         emb_open_dim=checkpoint.get("emb_open_dim", 8),
         emb_close_dim=checkpoint.get("emb_close_dim", 8),
         emb_hour_dim=checkpoint.get("emb_hour_dim", 4),
+        hidden_dim_1=hidden_dim_1,
+        hidden_dim_2=hidden_dim_2,
         dropout_rate=checkpoint.get("dropout_rate", 0.20),
         weight_decay=checkpoint.get("weight_decay", 1e-4),
         false_positive_cost_ratio=checkpoint.get("false_positive_cost_ratio", 2.0),
         lr=lr,
     )
-    state_dict = checkpoint.get("state_dict", checkpoint)
+
     if any(key.startswith("model.") for key in state_dict.keys()):
         remapped_state_dict = {}
         for key, value in state_dict.items():
@@ -579,9 +582,12 @@ def predict_from_inputs(nn, input1, input2, hour, extra_features=None):
     )
 
     if extra_features is None:
-        extra = np.zeros(nn.input_dim_extra, dtype=np.float32)
+        extra = np.zeros(len(EXTRA_FEATURE_COLUMNS), dtype=np.float32)
     else:
         extra = np.asarray(extra_features, dtype=np.float32).reshape(-1)
+
+    if nn.input_dim_extra >= (len(EXTRA_FEATURE_COLUMNS) + OPEN_NODE_BITS + CLOSE_NODE_BITS):
+        extra = _augment_extra_features(input1_id, input2_id, extra)
 
     if extra.shape[0] != nn.input_dim_extra:
         if extra.shape[0] > nn.input_dim_extra:
@@ -626,7 +632,10 @@ def load_data(csv_file, return_stats=False):
     input1_arr = np.asarray(input1_list, dtype=np.int64)
     input2_arr = np.asarray(input2_list, dtype=np.int64)
     hour_arr = np.asarray(hour_list, dtype=np.int64)
-    X_extra = np.vstack(extra_list).astype(np.float32)
+    X_extra = np.vstack([
+        _augment_extra_features(input1_id, input2_id, extra)
+        for input1_id, input2_id, extra in zip(input1_arr, input2_arr, extra_list)
+    ]).astype(np.float32)
     Y = np.array(Y_list).reshape(-1, 1).astype(np.float32)
 
     mean = X_extra.mean(axis=0).astype(np.float32)
@@ -688,7 +697,7 @@ def execute_entrenar(principal_symbol, mercados, list_algorithms = None):
             )
             nn.feature_mean = norm_stats["mean"]
             nn.feature_std = norm_stats["std"]
-            nn.fit(input1_ids, input2_ids, hour_ids, X_extra, Y, epochs=200, batch_size=32)
+            nn.fit(input1_ids, input2_ids, hour_ids, X_extra, Y, epochs=80, batch_size=64)
             model_path = f'output/{principal_symbol}/data_for_neuronal/model_trainer/model_{mercado}_{algorithm}.pt'
             save_trained_model(nn, model_path)
             print(f"Modelo entrenado guardado en '{model_path}'")

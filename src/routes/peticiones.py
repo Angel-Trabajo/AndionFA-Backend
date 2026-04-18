@@ -95,32 +95,3 @@ def get_historical_data(symbol, timeframe, start, end):
 
     return {"data": data}
 
-
-def get_data_by_days(symbol, timeframe, start, count_days):
-    start_dt = datetime.strptime(start, "%Y-%m-%d %H:%M:%S")
-    cont_days = int(count_days)
-
-    timeframe = int(timeframe)
-
-    rates = mt5.copy_rates_from(symbol, timeframe, start_dt, cont_days)
-    print(rates)
-
-    if rates is None or len(rates) == 0:
-        return {"error": "Error al extraer los datos"}
-
-    # Conversión explícita campo por campo
-    data = [
-        {
-            "time": int(r["time"]),
-            "open": float(r["open"]),
-            "high": float(r["high"]),
-            "low": float(r["low"]),
-            "close": float(r["close"]),
-            "tick_volume": int(r["tick_volume"]),
-            "spread": int(r["spread"]),
-            "real_volume": int(r["real_volume"]),
-        }
-        for r in rates
-    ]
-    return {"data": data}
-

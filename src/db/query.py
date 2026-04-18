@@ -335,76 +335,6 @@ def eliminar_nodo_y_registros(node_id):
     print(f"Nodo {node_id} y sus registros han sido eliminados.")
 
 
-def eliminar_nodos_y_registros(
-    principal_symbol: str | None = None,
-    symbol_cruce: str | None = None,
-    mercado: str | None = None
-    ):
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    try:
-        has_filters = any([principal_symbol, symbol_cruce, mercado])
-
-        if not has_filters:
-            cursor.execute("TRUNCATE TABLE register_os, register, nodes")
-            conn.commit()
-            print(
-                "Nodos y registros han sido eliminados. "
-                "Filtros aplicados: principal_symbol=None, symbol_cruce=None, mercado=None"
-            )
-            return
-
-        conditions = []
-        params = []
-
-        if principal_symbol:
-            conditions.append("n.principal_symbol = %s")
-            params.append(principal_symbol)
-        if symbol_cruce:
-            conditions.append("n.symbol_cruce = %s")
-            params.append(symbol_cruce)
-        if mercado:
-            conditions.append("n.mercado = %s")
-            params.append(mercado)
-
-        where_clause = " AND ".join(conditions) if conditions else "TRUE"
-
-        cursor.execute(
-            f"""
-            WITH target_nodes AS (
-                SELECT n.id
-                FROM nodes n
-                WHERE {where_clause}
-            ),
-            deleted_register_os AS (
-                DELETE FROM register_os ro
-                USING target_nodes tn
-                WHERE ro.node_id = tn.id
-                RETURNING ro.node_id
-            ),
-            deleted_register AS (
-                DELETE FROM register r
-                USING target_nodes tn
-                WHERE r.node_id = tn.id
-                RETURNING r.node_id
-            )
-            DELETE FROM nodes n
-            USING target_nodes tn
-            WHERE n.id = tn.id
-            """,
-            tuple(params)
-        )
-        conn.commit()
-
-        print(
-            f"Nodos y registros han sido eliminados. Filtros aplicados: "
-            f"principal_symbol={principal_symbol}, symbol_cruce={symbol_cruce}, mercado={mercado}"
-        )
-    finally:
-        release_connection(conn)
-
-
 def promedio_correct_percentage(principal_symbol, symbol_cruce, mercado, label, modo):
 
     conn = get_connection()
@@ -684,50 +614,6 @@ def get_top_quality_nodes(
         mercado=mercado,
         label=label,
         order_by="quality_score",
-        descending=True,
-        limit=limit,
-        offset=offset,
-        min_total_operations=min_total_operations,
-    )
-
-
-def get_top_expectancy_nodes(
-    principal_symbol=None,
-    symbol_cruce=None,
-    mercado=None,
-    label=None,
-    limit=25,
-    offset=0,
-    min_total_operations=10,
-):
-    return get_ranked_nodes(
-        principal_symbol=principal_symbol,
-        symbol_cruce=symbol_cruce,
-        mercado=mercado,
-        label=label,
-        order_by="expectancy",
-        descending=True,
-        limit=limit,
-        offset=offset,
-        min_total_operations=min_total_operations,
-    )
-
-
-def get_top_profit_factor_nodes(
-    principal_symbol=None,
-    symbol_cruce=None,
-    mercado=None,
-    label=None,
-    limit=25,
-    offset=0,
-    min_total_operations=10,
-):
-    return get_ranked_nodes(
-        principal_symbol=principal_symbol,
-        symbol_cruce=symbol_cruce,
-        mercado=mercado,
-        label=label,
-        order_by="profit_factor",
         descending=True,
         limit=limit,
         offset=offset,

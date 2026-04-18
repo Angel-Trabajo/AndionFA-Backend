@@ -1,7 +1,9 @@
 import os
 import shutil
+import math
+import numpy as np
+import json
 from datetime import datetime
-import sqlite3
 
 def limpiar_carpeta(ruta_carpeta):
     if os.path.exists(ruta_carpeta):
@@ -14,35 +16,6 @@ def limpiar_carpeta(ruta_carpeta):
         print(f"Contenido de la carpeta '{ruta_carpeta}' eliminado correctamente.")
     else:
         print(f"La carpeta '{ruta_carpeta}' no existe.")
-
-def eliminar_ruta(ruta):
-    if os.path.exists(ruta):
-        if os.path.isfile(ruta):
-            os.remove(ruta)  # elimina archivo
-            print(f"Archivo '{ruta}' eliminado correctamente.")
-        elif os.path.isdir(ruta):
-            shutil.rmtree(ruta)  # elimina carpeta con todo su contenido
-            print(f"Carpeta '{ruta}' eliminada correctamente.")
-    else:
-        print(f"La ruta '{ruta}' no existe.")
-
-def eliminar_archivo(ruta_archivo):
-    if os.path.exists(ruta_archivo):
-        os.remove(ruta_archivo)
-        print(f"Archivo '{ruta_archivo}' eliminado correctamente.")
-    else:
-        print(f"El archivo '{ruta_archivo}' no existe.")
-
-def tabla_nodes_existe(db_path):
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='nodes'")
-        existe = cursor.fetchone() is not None
-        conn.close()
-        return existe
-    except:
-        return False
 
 def crear_carpeta_si_no_existe(ruta_carpeta):
     if not os.path.exists(ruta_carpeta):
@@ -105,13 +78,15 @@ def hora_en_mercado(hour, mercado):
     return True
 
 
-def should_backtest_strategy(metrics):
-    import math
-    import numpy as np
+def evaluate_live_strategy_filter(metrics, live_config=None):
+    if live_config is None:
+        with open('config/live_config.json', 'r', encoding='utf-8') as f:
+            live_config = json.load(f).get("live", {})
 
     winrate = metrics.get("winrate", 0)
     profit_factor = metrics.get("profit_factor", 0)
     expectancy = metrics.get("expectancy", 0)
+    cantidad_operaciones = metrics.get("cantidad_operaciones", 0)
     list_pips_monthly = list(metrics.get("temporal_stats", {}).get("monthly_pips", {}).values())
 
     def score(fila):
@@ -131,14 +106,30 @@ def should_backtest_strategy(metrics):
         return 1 / (1 + math.exp(-s / 100))
 
     if not list_pips_monthly:
-        return False
+        return {
+            "passed": False,
+            "probabilidad": 0,
+            "score": 0,
+            "reason": "no_monthly_pips",
+        }
 
     s = score(list_pips_monthly)
     prob = probabilidad(s)
 
-    return (
-        winrate >= 0.40 and
-        profit_factor >= 1 and
-        expectancy >= 1 and
-        prob >= 0.55
+    passed = (
+        winrate >= live_config.get("winrate", 0) and
+        profit_factor >= live_config.get("profit_factor", 0) and
+        expectancy >= live_config.get("expectancy", 0) and
+        prob >= live_config.get("probabilidad", 0) and
+        cantidad_operaciones >= live_config.get("cantidad_operaciones", 0)
     )
+
+    return {
+        "passed": bool(passed),
+        "probabilidad": float(prob),
+        "score": float(s),
+        "reason": "ok" if passed else "threshold_not_met",
+    }
+
+def should_backtest_strategy(metrics, live_config=None):
+    return evaluate_live_strategy_filter(metrics, live_config=live_config)["passed"]

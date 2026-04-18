@@ -1,7 +1,3 @@
-import os
-import asyncio
-
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -24,8 +20,6 @@ async def startup_event():
 
 
 load_dotenv()
-FRONTEND_VITE = os.getenv("FRONTEND_VITE")
-origins = [origin.strip().rstrip('/') for origin in FRONTEND_VITE.split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Orígenes permitidos

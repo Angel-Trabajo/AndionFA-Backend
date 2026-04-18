@@ -3,7 +3,6 @@ import os
 import sys
 import logging
 import threading
-from datetime import time
 import time as tim
 import operator
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -104,7 +103,7 @@ def max_losing_streak(values):
     return max_streak
 
 
-def calculate_node_quality_stats(pips_list):
+def calculate_node_quality_stats(pips_list, num_conditions=3):
     values = np.asarray(pips_list, dtype=np.float64)
     if values.size == 0:
         return None
@@ -121,13 +120,20 @@ def calculate_node_quality_stats(pips_list):
     max_drawdown = float(abs(drawdowns.min())) if drawdowns.size else 0.0
     drawdown_ratio = max_drawdown / max(abs(float(values.sum())), 1.0)
     loss_streak = max_losing_streak(values)
-    quality_score = float(
+    num_trades = int(values.size)
+    winrate = float((values > 0).mean()) if num_trades else 0.0
+
+    quality_base = float(
         (expectancy * 1.5) +
         (min(profit_factor, 3.0) * 2.0) +
         (min(sharpe_like, 2.5) * 1.5) -
         (drawdown_ratio * 2.0) -
         (max(loss_streak - 3, 0) * 0.25)
+        + (winrate * 0.5)
     )
+    trade_weight = float(num_trades / (num_trades + 50.0))
+    complexity_factor = float(1.0 / (1.0 + 0.15 * max(int(num_conditions) - 3, 0)))
+    quality_score = float(quality_base * trade_weight * complexity_factor)
 
     return {
         'expectancy': expectancy,
@@ -136,6 +142,10 @@ def calculate_node_quality_stats(pips_list):
         'max_drawdown': max_drawdown,
         'drawdown_ratio': float(drawdown_ratio),
         'max_losing_streak': int(loss_streak),
+        'winrate': winrate,
+        'num_trades': num_trades,
+        'trade_weight': trade_weight,
+        'complexity_factor': complexity_factor,
         'quality_score': quality_score,
     }
 
@@ -286,17 +296,6 @@ def selecte_nodes(
         else:
             list_nodos = [nodo for nodo in list_nodos if nodo['label'] == action]
 
-    ext = file.split('_')[0]
-    dire = next(
-        f for f in os.listdir(
-            f'output/symbol_data/{symbol}/extrac_os'
-        )
-        if ext in f
-    )
-    
-    
-     
-   
     is_path = f'output/symbol_data/{symbol}/extrac/{file}'
     indicators_is = pd.read_parquet(is_path)
     # Convertir time a datetime ANTES de slice/copy
@@ -315,7 +314,8 @@ def selecte_nodes(
     
     df_os = df_bas.iloc[int(len(df_bas)*0.8):].copy()  # Para no modificar el original
     df_is = df_bas.iloc[:int(len(df_bas)*0.8)].copy()  # Para no modificar el original
-    pip_size, point_size = _pip_sizes(df_os['open'], symbol)
+    # Beneficios y spreads se miden sobre precio del principal_symbol.
+    pip_size, point_size = _pip_sizes(df_os['open'], principal_symbol)
     
     os_time_np = df_os['time'].to_numpy()
     is_time_np = df_is['time'].to_numpy()
@@ -450,9 +450,12 @@ def selecte_nodes(
         if total == 0:
             continue
         porcentaje_os = (aciertos / total)
-        if not (prev_os + (porcent_aumento_os - 0.02) <= porcentaje_os <= prev_os + (porcent_aumento_os + 0.02)):
+        if not (prev_os + (porcent_aumento_os - 0.025) <= porcentaje_os <= prev_os + (porcent_aumento_os + 0.025)):
             continue        
-        stats_os = calculate_node_quality_stats(list_beneficio_os)
+        stats_os = calculate_node_quality_stats(
+            list_beneficio_os,
+            num_conditions=nodo.get('num_conditions', len(conditions)),
+        )
         progressive_os = total/len(df_indicators_os)
        
         #--------------------------------------------------------------------------------
@@ -513,9 +516,12 @@ def selecte_nodes(
             continue
         porcentaje_aciertos_is = (aciertos_is / total_is)
        
-        if not (prev_is + (porcent_aumento_is - 0.015) <= porcentaje_aciertos_is <= prev_is + (porcent_aumento_is + 0.015)):
+        if not (prev_is + (porcent_aumento_is - 0.025) <= porcentaje_aciertos_is <= prev_is + (porcent_aumento_is + 0.025)):
             continue
-        stats_is = calculate_node_quality_stats(list_beneficio_is)
+        stats_is = calculate_node_quality_stats(
+            list_beneficio_is,
+            num_conditions=nodo.get('num_conditions', len(conditions)),
+        )
         if not passes_quality_filters(stats_is, stats_os, config):
             continue
         
@@ -620,7 +626,7 @@ def procesar_archivo(file: str, symbol, action, cont, prev_os, prev_is, porcent_
 def calcular_porcentage(symbol, prev, config):
     sumatoria = 0
     dict_symbol_correl = config["symbol"]["dict_symbol_correl"]
-    for key, value in dict_symbol_correl.items():
+    for value in dict_symbol_correl.values():
         sumatoria += value
     corre = dict_symbol_correl[symbol]
     return corre/sumatoria * (1-prev)

@@ -18,6 +18,10 @@ from src.signals.event_generator import add_event_features, has_entry_event
 from src.utils.common_functions import hora_en_mercado, crear_carpeta_si_no_existe, should_backtest_strategy
 
 
+VERBOSE_TRADE_LOGS = os.getenv("VERBOSE_TRADE_LOGS", "0") == "1"
+TRADE_LOG_EVERY = max(1, int(os.getenv("TRADE_LOG_EVERY", "25")))
+
+
 def plot_all_backtests_results(base_dir='output/x_backtest_results'):
     if not os.path.exists(base_dir):
         print(f"No existe la carpeta base: {base_dir}")
@@ -105,6 +109,8 @@ class Backtest:
         self.principal_symbol = principal_symbol
         self.mercado = mercado
         self.algorithm = algorithm
+        self.closed_trades_count = 0
+        self.closed_pips_total = 0.0
         self.date_start = date_start
         self.date_end = date_end
         self.indicators = {} 
@@ -224,17 +230,17 @@ class Backtest:
             with open(score_path, 'r') as file:
                 score_data = json.load(file)
             self.strategy_metrics = score_data.get("metrics", {})
-            self.strategy_selection = self.strategy_metrics.get("selection", {})
-            ensemble_info = self.strategy_metrics.get("ensemble", {})
-            self.ensemble_model_path = ensemble_info.get("model_path")
+            raw_threshold = self.strategy_metrics.get("best_threshold", self.close_threshold_floor)
+            try:
+                threshold_value = float(raw_threshold)
+            except (TypeError, ValueError):
+                threshold_value = self.close_threshold_floor
             self.close_threshold = max(
-                ensemble_info.get("threshold", self.strategy_metrics.get("best_threshold", 0.5)),
+                threshold_value,
                 self.close_threshold_floor,
             )
         else:
             self.strategy_metrics = {}
-            self.strategy_selection = {}
-            self.ensemble_model_path = None
             self.close_threshold = self.close_threshold_floor
       
         
@@ -255,7 +261,7 @@ class Backtest:
 
         self.dict_nodos = {}
 
-        for i, symbol in enumerate(self.list_symbols):
+        for symbol in self.list_symbols:
             self.dict_nodos[symbol] = self.parsear_nodos(
                 get_nodes_by_label(self.principal_symbol, symbol, self.mercado, self.algorithm) or []
             )
@@ -350,11 +356,9 @@ class Backtest:
     def test_iteration(self):
 
         path_data_red = f'output/{self.principal_symbol}/data_for_neuronal/data/data_{self.mercado}_{self.algorithm}.csv'
-        input1_ids, input2_ids, hour_ids, X_extra, Y = load_data(path_data_red)
+        input1_ids, input2_ids, hour_ids, X_extra, _ = load_data(path_data_red)
 
-        model_path = self.ensemble_model_path
-        if not model_path or not os.path.exists(model_path):
-            model_path = f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.pt'
+        model_path = f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.pt'
 
         nn = load_trained_model(
             model_path,
@@ -436,6 +440,8 @@ class Backtest:
 
                 if cerrar:
                     trade_pips = current_pips
+                    self.closed_trades_count += 1
+                    self.closed_pips_total += trade_pips
                     self.results["time_open"].append(time_comienzo)
                     self.results["time_close"].append(time_actual)
                     self.results["pips"].append(trade_pips)
@@ -443,7 +449,13 @@ class Backtest:
                     self.results["close_reason"].append(close_reason)
                     is_open = False
                     model_close_streak = 0
-                    print(f"SUM PIPS:{time_comienzo} ---- {time_actual}: {trade_pips} prob:{prob}", cierre)
+                    if VERBOSE_TRADE_LOGS:
+                        print(f"SUM PIPS:{time_comienzo} ---- {time_actual}: {trade_pips}", cierre)
+                    elif self.closed_trades_count % TRADE_LOG_EVERY == 0:
+                        print(
+                            f"RESUMEN {self.principal_symbol} {self.mercado}_{self.algorithm} | "
+                            f"ops={self.closed_trades_count} | pips={self.closed_pips_total:.2f}"
+                        )
 
             # =========================
             # APERTURA
@@ -554,11 +566,26 @@ if __name__ == "__main__":
     list_principal_symbols = config['list_principal_symbols']
     date_start = backtest_config.get("date_start", "2025-01-01")
     date_end = backtest_config.get("date_end", "2026-01-01")
-    for principal_symbol in list_principal_symbols[0:3]:
+    for principal_symbol in list_principal_symbols:
         for mercado in list_mercado:
             for algorithm in list_algorithms:
-                with open(f'output/{principal_symbol}/data_for_neuronal/best_score/score_{mercado}_{algorithm}.json', 'r') as file:
-                    best_score_data = json.load(file)
+                score_path = f'output/{principal_symbol}/data_for_neuronal/best_score/score_{mercado}_{algorithm}.json'
+                if not os.path.exists(score_path):
+                    print(
+                        f"Saltando backtest para {principal_symbol} - {mercado} - {algorithm}: "
+                        f"no existe {score_path}"
+                    )
+                    continue
+
+                try:
+                    with open(score_path, 'r', encoding='utf8') as file:
+                        best_score_data = json.load(file)
+                except FileNotFoundError:
+                    print(
+                        f"Saltando backtest para {principal_symbol} - {mercado} - {algorithm}: "
+                        f"no existe {score_path}"
+                    )
+                    continue
                 metrics = best_score_data.get("metrics", {})
                 should_run = should_backtest_strategy(metrics)
                 if not should_run:

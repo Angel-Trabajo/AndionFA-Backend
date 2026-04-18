@@ -15,7 +15,6 @@ import pyarrow.parquet as pq
 import torch
 
 from datetime import datetime
-from dateutil.relativedelta import relativedelta
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
@@ -31,11 +30,14 @@ from src.neuronal.entrenar import (
     has_minimum_training_data,
     load_data,
     save_trained_model,
-    save_ensemble_model,
     get_embedding_vocab_sizes,
     validate_embedding_vocab,
 )
-from src.signals.event_generator import EVENT_FEATURE_COLUMNS, add_event_features, has_entry_event
+from src.signals.event_generator import add_event_features, has_entry_event
+
+
+VERBOSE_TRADE_LOGS = os.getenv("VERBOSE_TRADE_LOGS", "0") == "1"
+TRADE_LOG_EVERY = max(1, int(os.getenv("TRADE_LOG_EVERY", "25")))
 
 
 def _max_decimals(series, sample_size=1000):
@@ -93,7 +95,6 @@ class Backtester:
         self.peor_trade = 0.0
         self.info_score = {}
         self.iteration_candidates = []
-        self.ensemble_model_entries = []
         self.dict_pips_best = {}
         self.stop_loss = 20
         self.take_profit = 150
@@ -101,60 +102,20 @@ class Backtester:
         self.min_model_holding = 15
         self.close_confirmation_bars = 2
         self.close_threshold_floor = 0.60
-        self.close_threshold_ceiling = 0.70
-        self.close_threshold_history = []
-        self.close_threshold_history_window = 5
-        self.threshold_validation_split_ratio = 0.50
-        self.validation_window_months = 6
+        self.validation_window_fraction = 0.15
         self.min_open_symbol_confirmations = 4
         self.train_b_fraction = 0.30
-        self.threshold_min_calibration_trades = 15
-        self.threshold_min_selected_trades = 10
-        self.robust_score_weights = {
-            "expectancy": 2.0,
-            "profit_factor": 1.5,
-            "sharpe": 2.0,
-            "winrate": 1.0,
-            "calmar_ratio": 1.8,
-            "sortino_ratio": 1.5,
-        }
-        self.robust_trade_penalty_scale = 12
-        self.robust_min_avg_bars = 12
-        self.ensemble_top_k = 3
-        self.ensemble_decay_factor = 0.9
+        self.walk_forward_enabled = True
+        self.walk_forward_min_train_fraction = 0.50
+        self.walk_forward_step_fraction = None
+        self.walk_forward_folds = []
+        self.current_fold_index = 0
         self.label_percentile_threshold = 65
         self.label_min_context_samples = 25
         self.label_volatility_floor_pips = 5.0
-        self.min_winning_iteration = 1
-        self.max_iterations = 15
-        self.early_stopping_patience = 8
+        self.max_iterations = 5
+        self.early_stopping_patience = 2
         self.no_improve_iterations = 0
-        self.min_trades_score = 30
-        self.trade_reliability_k = 40
-        self.low_trade_penalty_power = 1.75
-        self.selection_min_trades = 30
-        self.selection_min_profit_factor = 1.15
-        self.selection_min_expectancy = 0.25
-        self.selection_min_winrate = 0.45
-        self.selection_max_drawdown_ratio = 1.50
-        self.selection_max_losing_streak = 7
-        self.selection_min_months = 4
-        self.selection_min_positive_month_ratio = 0.50
-        self.selection_min_positive_quarter_ratio = 0.50
-        self.selection_strong_candidate_min_trades = 20
-        self.selection_strong_candidate_min_profit_factor = 1.35
-        self.selection_strong_candidate_min_expectancy = 4.0
-        self.selection_strong_candidate_min_winrate = 0.40
-        self.selection_strong_candidate_max_drawdown_ratio = 1.75
-        self.selection_strong_candidate_max_losing_streak = 8
-        self.selection_strong_candidate_min_positive_month_ratio = 0.50
-        self.selection_strong_candidate_min_positive_quarter_ratio = 0.50
-        self.selection_strong_candidate_min_deployment_score = 12.0
-        self.selection_strong_candidate_allowed_reasons = {
-            "low_trades",
-            "low_winrate",
-            "low_positive_month_ratio",
-        }
         self.train_b_label_blocks = 3
         self.min_training_samples = MIN_TRAINING_SAMPLES
         self.principal_symbol = principal_symbol
@@ -194,21 +155,39 @@ class Backtester:
         self.list_symbols = config_symbol['list_symbol']
         self.list_symbols.insert(0, self.principal_symbol)
         self.general_config = general_config
-        self.config_symbol = config_symbol
         self.min_open_symbol_confirmations = int(
             self.general_config.get('MinOpenSymbolConfirmations', self.min_open_symbol_confirmations)
         )
-        self.robust_trade_penalty_center = int(
-            self.general_config.get('robust_trade_penalty_center', 25)
+        self.walk_forward_enabled = bool(
+            self.general_config.get('walk_forward_enabled', self.walk_forward_enabled)
+        )
+        self.validation_window_fraction = float(
+            self.general_config.get('validation_window_fraction', self.validation_window_fraction)
+        )
+        self.validation_window_fraction = min(max(self.validation_window_fraction, 0.05), 0.95)
+        self.walk_forward_min_train_fraction = float(
+            self.general_config.get('walk_forward_min_train_fraction', self.walk_forward_min_train_fraction)
+        )
+        self.walk_forward_min_train_fraction = min(
+            max(self.walk_forward_min_train_fraction, self.validation_window_fraction),
+            0.95
+        )
+        step_fraction_cfg = self.general_config.get(
+            'walk_forward_step_fraction',
+            self.validation_window_fraction
+        )
+        self.walk_forward_step_fraction = min(max(float(step_fraction_cfg), 0.01), 0.95)
+        self.max_iterations = max(1, int(self.general_config.get('max_iterations', self.max_iterations)))
+        self.early_stopping_patience = max(
+            0, int(self.general_config.get('early_stopping_patience', self.early_stopping_patience))
         )
         self.stop_loss = int(self.general_config.get('stop_loss', self.stop_loss))
         self.take_profit = int(self.general_config.get('take_profit', self.take_profit))
-        data_start_is, data_end_is = get_previous_4_6(
+        data_start_is, _ = get_previous_4_6(
             self.general_config['dateStart'], 
             self.general_config['dateEnd']
         )
         self.data_start_is = data_start_is
-        self.data_end_is = data_end_is
         
     def prepare_base_data(self):
 
@@ -234,47 +213,131 @@ class Backtester:
 
 
     def split_temporal_windows(self, df_base):
+        if self.walk_forward_enabled:
+            self.walk_forward_folds = self.build_walk_forward_folds(df_base)
+            if self.walk_forward_folds:
+                self.apply_walk_forward_fold(0)
+                return
+
         if df_base.empty:
             self.df_train_A = df_base
             self.df_train_B = df_base
             self.df_valid = df_base
             return
 
-        validation_end = df_base.index.max()
-        validation_start = validation_end - relativedelta(months=self.validation_window_months)
-        df_valid = df_base[df_base.index >= validation_start]
-        df_pre_validation = df_base[df_base.index < validation_start]
-
-        if df_valid.empty:
-            fallback_cut = max(1, int(len(df_base) * 0.15))
-            df_valid = df_base.iloc[-fallback_cut:]
-            df_pre_validation = df_base.iloc[:-fallback_cut]
+        total_rows = len(df_base)
+        valid_size = int(round(total_rows * self.validation_window_fraction))
+        valid_size = max(1, valid_size)
+        if total_rows > 1:
+            valid_size = min(valid_size, total_rows - 1)
+        df_valid = df_base.iloc[-valid_size:]
+        df_pre_validation = df_base.iloc[:-valid_size]
 
         if df_pre_validation.empty:
-            split_idx = max(1, len(df_base) - len(df_valid))
-            self.df_train_A = df_base.iloc[:split_idx]
+            self.df_train_A = df_base.iloc[:0].copy()
             self.df_train_B = df_base.iloc[:0].copy()
             self.df_valid = df_valid
             return
 
-        train_b_size = int(len(df_pre_validation) * self.train_b_fraction)
-        train_b_size = max(1, train_b_size)
-        train_b_size = min(train_b_size, len(df_pre_validation))
-        split_idx = len(df_pre_validation) - train_b_size
-
-        if split_idx <= 0:
-            split_idx = max(1, len(df_pre_validation) - 1)
+        if len(df_pre_validation) == 1:
+            split_idx = 1
+        else:
+            train_b_size = int(round(len(df_pre_validation) * self.train_b_fraction))
+            train_b_size = max(1, min(train_b_size, len(df_pre_validation) - 1))
+            split_idx = len(df_pre_validation) - train_b_size
 
         self.df_train_A = df_pre_validation.iloc[:split_idx]
         self.df_train_B = df_pre_validation.iloc[split_idx:]
         self.df_valid = df_valid
 
         print(
-            "Ventanas temporales preparadas | "
+            "Ventanas temporales por porcentaje | "
             f"train_A: {self.df_train_A.index.min()} -> {self.df_train_A.index.max()} ({len(self.df_train_A)}) | "
             f"train_B: {self.df_train_B.index.min() if not self.df_train_B.empty else 'empty'} -> "
             f"{self.df_train_B.index.max() if not self.df_train_B.empty else 'empty'} ({len(self.df_train_B)}) | "
-            f"valid: {self.df_valid.index.min()} -> {self.df_valid.index.max()} ({len(self.df_valid)})"
+            f"valid: {self.df_valid.index.min()} -> {self.df_valid.index.max()} ({len(self.df_valid)}) | "
+            f"valid_fraction: {self.validation_window_fraction:.2f}"
+        )
+
+
+    def build_walk_forward_folds(self, df_base):
+        if df_base.empty:
+            return []
+
+        total_rows = len(df_base)
+        valid_size = int(round(total_rows * self.validation_window_fraction))
+        valid_size = max(1, valid_size)
+        if total_rows > 1:
+            valid_size = min(valid_size, total_rows - 1)
+
+        min_train_size = int(round(total_rows * self.walk_forward_min_train_fraction))
+        min_train_size = max(valid_size, min_train_size)
+        if total_rows > 1:
+            min_train_size = min(min_train_size, total_rows - 1)
+
+        step_size = int(round(total_rows * self.walk_forward_step_fraction))
+        step_size = max(1, step_size)
+
+        folds = []
+        valid_start_idx = min_train_size
+
+        while valid_start_idx < total_rows:
+            valid_end_idx = min(total_rows, valid_start_idx + valid_size)
+            df_train = df_base.iloc[:valid_start_idx]
+            df_valid = df_base.iloc[valid_start_idx:valid_end_idx]
+
+            if not df_train.empty and not df_valid.empty:
+                if len(df_train) == 1:
+                    split_idx = 1
+                else:
+                    train_b_size = int(round(len(df_train) * self.train_b_fraction))
+                    train_b_size = max(1, min(train_b_size, len(df_train) - 1))
+                    split_idx = len(df_train) - train_b_size
+
+                fold = {
+                    "train_A": df_train.iloc[:split_idx],
+                    "train_B": df_train.iloc[split_idx:],
+                    "valid": df_valid,
+                    "meta": {
+                        "train_start": df_train.index.min(),
+                        "train_end": df_train.index.max(),
+                        "valid_start": df_valid.index.min(),
+                        "valid_end": df_valid.index.max(),
+                    },
+                }
+                folds.append(fold)
+
+            if valid_end_idx >= total_rows:
+                break
+            valid_start_idx = valid_start_idx + step_size
+
+        if folds:
+            print(
+                "Walk-forward por porcentaje | "
+                f"folds: {len(folds)} | "
+                f"valid_fraction: {self.validation_window_fraction:.2f} | "
+                f"min_train_fraction: {self.walk_forward_min_train_fraction:.2f} | "
+                f"step_fraction: {self.walk_forward_step_fraction:.2f}"
+            )
+        return folds
+
+
+    def apply_walk_forward_fold(self, fold_index):
+        if not self.walk_forward_folds:
+            return
+
+        bounded_index = max(0, min(fold_index, len(self.walk_forward_folds) - 1))
+        fold = self.walk_forward_folds[bounded_index]
+        self.current_fold_index = bounded_index
+        self.df_train_A = fold["train_A"]
+        self.df_train_B = fold["train_B"]
+        self.df_valid = fold["valid"]
+
+        print(
+            "Walk-forward fold activo | "
+            f"fold={bounded_index + 1}/{len(self.walk_forward_folds)} | "
+            f"train: {fold['meta']['train_start']} -> {fold['meta']['train_end']} ({len(self.df_train_A) + len(self.df_train_B)}) | "
+            f"valid: {fold['meta']['valid_start']} -> {fold['meta']['valid_end']} ({len(self.df_valid)})"
         )
 
 
@@ -392,7 +455,7 @@ class Backtester:
 
         self.dict_nodos = {}
 
-        for i, symbol in enumerate(self.list_symbols):
+        for symbol in self.list_symbols:
             self.dict_nodos[symbol] = self.parsear_nodos(
                 get_nodes_by_label(self.principal_symbol, symbol, self.mercado, self.algorithm) or []
             )
@@ -620,68 +683,6 @@ class Backtester:
         return pd.concat(dataset_parts, ignore_index=True)
 
 
-    def build_selection_reference(self, metrics):
-        raw_reasons = []
-        if metrics["cantidad_operaciones"] < self.selection_min_trades:
-            raw_reasons.append("low_trades")
-        if metrics["profit_factor"] < self.selection_min_profit_factor:
-            raw_reasons.append("low_profit_factor")
-        if metrics["expectancy"] < self.selection_min_expectancy:
-            raw_reasons.append("low_expectancy")
-        if metrics["winrate"] < self.selection_min_winrate:
-            raw_reasons.append("low_winrate")
-        if metrics["max_drawdown_ratio"] > self.selection_max_drawdown_ratio:
-            raw_reasons.append("high_drawdown_ratio")
-        if metrics["mas_perdidas_seguidas"] > self.selection_max_losing_streak:
-            raw_reasons.append("high_losing_streak")
-        if metrics["temporal_stats"]["n_months"] < self.selection_min_months:
-            raw_reasons.append("low_month_coverage")
-        if metrics["temporal_stats"]["positive_month_ratio"] < self.selection_min_positive_month_ratio:
-            raw_reasons.append("low_positive_month_ratio")
-        if metrics["temporal_stats"]["positive_quarter_ratio"] < self.selection_min_positive_quarter_ratio:
-            raw_reasons.append("low_positive_quarter_ratio")
-
-        deployment_score = (
-            (metrics["profit_factor"] * 2.0) +
-            (metrics["expectancy"] * 1.5) +
-            (metrics["winrate"] * 100.0 * 0.03) +
-            (metrics["sharpe"] * 1.5) -
-            (metrics["max_drawdown_ratio"] * 2.0) +
-            (metrics["temporal_stats"]["positive_month_ratio"] * 3.0) +
-            (metrics["temporal_stats"]["positive_quarter_ratio"] * 2.0)
-        )
-        if not np.isfinite(deployment_score):
-            deployment_score = -9999.0
-
-        return {
-            "raw_reasons": raw_reasons,
-            "deployment_score": float(deployment_score),
-            "thresholds": {
-                "min_trades": self.selection_min_trades,
-                "min_profit_factor": self.selection_min_profit_factor,
-                "min_expectancy": self.selection_min_expectancy,
-                "min_winrate": self.selection_min_winrate,
-                "max_drawdown_ratio": self.selection_max_drawdown_ratio,
-                "max_losing_streak": self.selection_max_losing_streak,
-                "min_months": self.selection_min_months,
-                "min_positive_month_ratio": self.selection_min_positive_month_ratio,
-                "min_positive_quarter_ratio": self.selection_min_positive_quarter_ratio,
-                "strong_candidate": {
-                    "min_trades": self.selection_strong_candidate_min_trades,
-                    "min_profit_factor": self.selection_strong_candidate_min_profit_factor,
-                    "min_expectancy": self.selection_strong_candidate_min_expectancy,
-                    "min_winrate": self.selection_strong_candidate_min_winrate,
-                    "max_drawdown_ratio": self.selection_strong_candidate_max_drawdown_ratio,
-                    "max_losing_streak": self.selection_strong_candidate_max_losing_streak,
-                    "min_positive_month_ratio": self.selection_strong_candidate_min_positive_month_ratio,
-                    "min_positive_quarter_ratio": self.selection_strong_candidate_min_positive_quarter_ratio,
-                    "min_deployment_score": self.selection_strong_candidate_min_deployment_score,
-                    "allowed_reasons": sorted(self.selection_strong_candidate_allowed_reasons),
-                },
-            },
-        }
-
-
     def summarize_temporal_performance(self, lista_pips):
         monthly_pips = {}
         quarterly_pips = {}
@@ -707,6 +708,9 @@ class Backtester:
             float(sum(1 for value in quarter_values if value > 0) / len(quarter_values))
             if quarter_values else 0.0
         )
+        
+        std_monthly = float(np.std(month_values)) if len(month_values) > 1 else 0.0
+        std_quarterly = float(np.std(quarter_values)) if len(quarter_values) > 1 else 0.0
 
         return {
             "n_months": len(month_values),
@@ -717,14 +721,11 @@ class Backtester:
             "worst_month_pips": float(min(month_values)) if month_values else 0.0,
             "best_quarter_pips": float(max(quarter_values)) if quarter_values else 0.0,
             "worst_quarter_pips": float(min(quarter_values)) if quarter_values else 0.0,
+            "std_monthly": std_monthly,
+            "std_quarterly": std_quarterly,
             "monthly_pips": monthly_pips,
             "quarterly_pips": quarterly_pips,
         }
-
-
-    def get_validation_window_df(self):
-        return self.df_valid
-
 
     def resolve_entry_open_nodes(self, time_actual_np):
         matched_symbols = 0
@@ -837,23 +838,9 @@ class Backtester:
                         "ret_1": float(row.ret_1),
                         "range_1": float(row.range_1),
                         "trend": float(row.trend),
-                        "vol": float(row.vol),
-                        "ret_3": float(row.ret_3),
-                        "ret_10": float(row.ret_10),
-                        "trend_10": float(row.trend_10),
-                        "trend_20": float(row.trend_20),
                         "vol_10": float(row.vol_10),
-                        "vol_20": float(row.vol_20),
                         "zscore_20": float(row.zscore_20),
                         "momentum_ratio": float(row.momentum_ratio),
-                        "event_breakout_up_20": float(getattr(row, 'event_breakout_up_20', 0.0)),
-                        "event_breakout_down_20": float(getattr(row, 'event_breakout_down_20', 0.0)),
-                        "event_volatility_expansion_10": float(getattr(row, 'event_volatility_expansion_10', 0.0)),
-                        "event_momentum_shift_up": float(getattr(row, 'event_momentum_shift_up', 0.0)),
-                        "event_momentum_shift_down": float(getattr(row, 'event_momentum_shift_down', 0.0)),
-                        "event_trend_alignment_up": float(getattr(row, 'event_trend_alignment_up', 0.0)),
-                        "event_trend_alignment_down": float(getattr(row, 'event_trend_alignment_down', 0.0)),
-                        "event_range_impulse": float(getattr(row, 'event_range_impulse', 0.0)),
                         "expected_pips": expected_pips,
                         "normalized_pips": normalized_pips,
                     })
@@ -873,19 +860,11 @@ class Backtester:
             'ret_1': [],
             'range_1': [],
             'trend': [],
-            'vol': [],
-            'ret_3': [],
-            'ret_10': [],
-            'trend_10': [],
-            'trend_20': [],
             'vol_10': [],
-            'vol_20': [],
             'zscore_20': [],
             'momentum_ratio': [],
             'output': []
         }
-        for event_column in EVENT_FEATURE_COLUMNS:
-            data[event_column] = []
 
         for sample in candidate_samples:
             reference_values = self.select_label_reference_values(
@@ -921,129 +900,15 @@ class Backtester:
             data['ret_1'].append(sample['ret_1'])
             data['range_1'].append(sample['range_1'])
             data['trend'].append(sample['trend'])
-            data['vol'].append(sample['vol'])
-            data['ret_3'].append(sample['ret_3'])
-            data['ret_10'].append(sample['ret_10'])
-            data['trend_10'].append(sample['trend_10'])
-            data['trend_20'].append(sample['trend_20'])
             data['vol_10'].append(sample['vol_10'])
-            data['vol_20'].append(sample['vol_20'])
             data['zscore_20'].append(sample['zscore_20'])
             data['momentum_ratio'].append(sample['momentum_ratio'])
-            for event_column in EVENT_FEATURE_COLUMNS:
-                data[event_column].append(sample[event_column])
             data['output'].append(label)
 
         df_dataset = pd.DataFrame(data)
 
         return df_dataset
 
-
-    def get_operational_close_threshold(self):
-        if self.close_threshold_history:
-            recent = self.close_threshold_history[-self.close_threshold_history_window:]
-            threshold = float(np.median(recent))
-        else:
-            threshold = self.info_score.get("best_threshold", self.close_threshold_floor)
-
-        threshold = max(threshold, self.close_threshold_floor)
-        threshold = min(threshold, self.close_threshold_ceiling)
-        return float(threshold)
-
-
-    def split_threshold_validation_trades(self, lista_pips):
-        trades_with_prob = [item for item in lista_pips if item.get("prob") is not None]
-        if len(trades_with_prob) < (self.threshold_min_calibration_trades + self.threshold_min_selected_trades):
-            return trades_with_prob, trades_with_prob
-
-        split_idx = int(len(trades_with_prob) * self.threshold_validation_split_ratio)
-        split_idx = max(self.threshold_min_calibration_trades, split_idx)
-        split_idx = min(split_idx, len(trades_with_prob) - self.threshold_min_selected_trades)
-
-        calibration = trades_with_prob[:split_idx]
-        scoring = trades_with_prob[split_idx:]
-        if not scoring:
-            scoring = calibration
-        return calibration, scoring
-
-
-    def score_threshold_subset(self, trade_subset, threshold):
-        selected = [
-            item["pips"]
-            for item in trade_subset
-            if item.get("prob") is not None and item["prob"] >= threshold
-        ]
-
-        if len(selected) < self.threshold_min_selected_trades:
-            return None
-
-        expectancy = float(np.mean(selected))
-        gross_profit = float(sum(value for value in selected if value > 0))
-        gross_loss = float(abs(sum(value for value in selected if value < 0)))
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else (2.0 if gross_profit > 0 else 0.0)
-        equity_curve = np.cumsum(selected)
-        running_max = np.maximum.accumulate(equity_curve)
-        drawdowns = equity_curve - running_max
-        max_drawdown = float(abs(drawdowns.min())) if len(drawdowns) else 0.0
-        drawdown_ratio = max_drawdown / max(abs(float(sum(selected))), 1.0)
-        score = (
-            (expectancy * np.sqrt(len(selected))) +
-            (min(profit_factor, 3.0) * 2.0) -
-            (drawdown_ratio * 2.0)
-        )
-        return {
-            "score": float(score),
-            "selected_trades": int(len(selected)),
-            "expectancy": expectancy,
-            "profit_factor": float(profit_factor),
-            "drawdown_ratio": float(drawdown_ratio),
-        }
-
-
-    def find_best_threshold(self, lista_pips):
-        calibration_trades, scoring_trades = self.split_threshold_validation_trades(lista_pips)
-        thresholds = np.linspace(self.close_threshold_floor, self.close_threshold_ceiling, 15)
-        best_thr = self.get_operational_close_threshold()
-        best_score = -np.inf
-        best_calibration_stats = None
-
-        for thr in thresholds:
-            calibration_stats = self.score_threshold_subset(calibration_trades, float(thr))
-            if calibration_stats is None:
-                continue
-
-            if calibration_stats["score"] > best_score:
-                best_score = calibration_stats["score"]
-                best_thr = float(thr)
-                best_calibration_stats = calibration_stats
-
-        if best_calibration_stats is None:
-            fallback_thr = self.get_operational_close_threshold()
-            fallback_score_stats = self.score_threshold_subset(scoring_trades, fallback_thr)
-            fallback_score = fallback_score_stats["score"] if fallback_score_stats else 0.0
-            return {
-                "threshold": float(fallback_thr),
-                "raw_threshold": float(fallback_thr),
-                "score": float(fallback_score),
-                "calibration_trades": int(len(calibration_trades)),
-                "scoring_trades": int(len(scoring_trades)),
-                "smoothed": bool(self.close_threshold_history),
-            }
-
-        self.close_threshold_history.append(best_thr)
-        smoothed_thr = self.get_operational_close_threshold()
-        scoring_stats = self.score_threshold_subset(scoring_trades, smoothed_thr)
-        scoring_score = scoring_stats["score"] if scoring_stats else 0.0
-
-        return {
-            "threshold": float(smoothed_thr),
-            "raw_threshold": float(best_thr),
-            "score": float(scoring_score),
-            "calibration_trades": int(len(calibration_trades)),
-            "scoring_trades": int(len(scoring_trades)),
-            "smoothed": True,
-        }
-        
 
     def preload_data(self):
 
@@ -1153,7 +1018,15 @@ class Backtester:
         )
         nn.feature_mean = norm_stats["mean"]
         nn.feature_std = norm_stats["std"]
-        nn.fit(input1_ids, input2_ids, hour_ids, X_extra, Y, epochs=200, batch_size=32)
+        nn.fit(
+            input1_ids,
+            input2_ids,
+            hour_ids,
+            X_extra,
+            Y,
+            epochs=80,
+            batch_size=64,
+        )
 
         model_path = f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.pt'
         save_trained_model(nn, model_path)
@@ -1181,7 +1054,7 @@ class Backtester:
     def validate_iteration(self):
 
         path_data_red = f'output/{self.principal_symbol}/data_for_neuronal/data/data_{self.mercado}_{self.algorithm}.csv'
-        input1_ids, input2_ids, hour_ids, X_extra, Y = load_data(path_data_red)
+        input1_ids, input2_ids, hour_ids, X_extra, _ = load_data(path_data_red)
 
         nn = load_trained_model(
             f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.pt',
@@ -1189,18 +1062,18 @@ class Backtester:
         )
         validate_embedding_vocab(nn, input1_ids, input2_ids, hour_ids)
 
-        df_validation = self.get_validation_window_df()
+        df_validation = self.df_valid
         validation_start = df_validation.index.min()
         validation_end = df_validation.index.max()
         print(
-            f"Validando sobre los últimos {self.validation_window_months} meses: "
+            f"Validando sobre el {self.validation_window_fraction:.2f} del dataset: "
             f"{validation_start} -> {validation_end} | barras={len(df_validation)}"
         )
 
         is_open = False
         open_price_open = 0.0
         spread_open = 0.0
-        entry_red_open = ''
+        entry_red_open = []
         cierre = 0
         model_close_streak = 0
         time_comienzo = None
@@ -1225,7 +1098,7 @@ class Backtester:
         }
         perdidas_seguidas = 0
         mas_perdidas_seguidas = 0
-        close_threshold = self.get_operational_close_threshold()
+        close_threshold = self.close_threshold_floor
 
         for row in df_validation.itertuples():
 
@@ -1275,9 +1148,12 @@ class Backtester:
                             nodo_close = self.maping_close.get(nodo["key"])
                             if nodo_close is None:
                                 continue
-                            prob = predict_from_inputs(nn, entry_red_open, nodo_close, hour, market_features)
-                            if prob > close_threshold:
-                                model_close_signal = True
+                            for entry in entry_red_open:
+                                prob = predict_from_inputs(nn, entry, nodo_close, hour, market_features)
+                                if prob > close_threshold:
+                                    model_close_signal = True
+                                    break
+                            if model_close_signal:
                                 break
 
                 if model_close_signal:
@@ -1321,7 +1197,13 @@ class Backtester:
                         operaciones_perdedoras += 1
                         perdida_bruta += abs(trade_pips)
 
-                    print(f"SUM PIPS:{time_comienzo} ---- {time_actual}: {sum_pips}", cierre)
+                    if VERBOSE_TRADE_LOGS:
+                        print(f"SUM PIPS:{time_comienzo} ---- {time_actual}: {sum_pips}", cierre)
+                    elif cantidad_operaciones % TRADE_LOG_EVERY == 0:
+                        print(
+                            f"RESUMEN {self.principal_symbol} {self.mercado}_{self.algorithm} | "
+                            f"ops={cantidad_operaciones} | pips={sum_pips:.2f}"
+                        )
 
             # =========================
             # APERTURA
@@ -1341,7 +1223,7 @@ class Backtester:
                     is_open = True
                     time_comienzo = time_actual
                     model_close_streak = 0
-                    entry_red_open = open_nodes[0]
+                    entry_red_open = open_nodes
 
             if perdidas_seguidas > mas_perdidas_seguidas:
                 mas_perdidas_seguidas = perdidas_seguidas
@@ -1389,9 +1271,17 @@ class Backtester:
             sortino_ratio = 0.0
         temporal_stats = self.summarize_temporal_performance(lista_pips)
 
-        threshold_info = self.find_best_threshold(lista_pips)
-        best_thr = threshold_info["threshold"]
-        best_threshold_score = threshold_info["score"]
+        best_thr = float(self.close_threshold_floor)
+        threshold_info = {
+            "threshold": best_thr,
+            "raw_threshold": best_thr,
+            "score": 0.0,
+            "calibration_trades": int(len(lista_pips)),
+            "scoring_trades": int(len(lista_pips)),
+            "smoothed": False,
+        }
+        best_threshold_score = 0.0
+        mc_score = 1.0
         print(
             f"Best threshold: {best_thr:.3f} | Score: {best_threshold_score:.4f} | "
             f"raw={threshold_info['raw_threshold']:.3f}"
@@ -1403,6 +1293,7 @@ class Backtester:
         Profit Factor: {profit_factor:.2f}
         Expectancy: {expectancy:.4f}
         Pips Totales: {sum_pips:.2f}
+        Monte Carlo Stability: {mc_score:.4f}
         """)
 
         metrics = {
@@ -1424,173 +1315,50 @@ class Backtester:
             "median_bars_held": median_bars_held,
             "close_reason_counts": close_reason_counts,
             "temporal_stats": temporal_stats,
+            "monte_carlo_score": mc_score,
             "validation_window": {
-                "months": self.validation_window_months,
+                "fraction": float(self.validation_window_fraction),
                 "start": validation_start.isoformat() if hasattr(validation_start, "isoformat") else str(validation_start),
                 "end": validation_end.isoformat() if hasattr(validation_end, "isoformat") else str(validation_end),
                 "bars": int(len(df_validation)),
             },
+            "walk_forward": {
+                "enabled": bool(self.walk_forward_folds),
+                "fold_index": int(self.current_fold_index + 1) if self.walk_forward_folds else 1,
+                "total_folds": int(len(self.walk_forward_folds)) if self.walk_forward_folds else 1,
+            },
+            "walk_forward_penalty": 1.0,
             "cantidad_operaciones": cantidad_operaciones,
             "sum_pips": sum_pips,
             "mas_perdidas_seguidas": mas_perdidas_seguidas
         }
-        metrics["selection_reference"] = self.build_selection_reference(metrics)
         return metrics
     
 
     def calculate_preliminary_score(self, metrics):
-
         profit_factor_adj = min(metrics["profit_factor"], 5)
         sharpe_adj = min(metrics["sharpe"], 3)
         n_ops = metrics["cantidad_operaciones"]
-
         score_base = (
             (metrics["expectancy"] * 2.0) +
             (profit_factor_adj * 1.5) +
-            (sharpe_adj * 2.0) +
+            (sharpe_adj * 1.5) +
             (metrics["winrate"] * 1.0)
         )
 
         volumen_factor = np.log(n_ops + 1)
-        reliability_factor = n_ops / (n_ops + self.trade_reliability_k) if n_ops > 0 else 0.0
-        min_trades_factor = min(1.0, n_ops / self.min_trades_score) if self.min_trades_score > 0 else 1.0
-        low_trade_penalty = min_trades_factor ** self.low_trade_penalty_power
-
-        score = score_base * volumen_factor * reliability_factor * low_trade_penalty
+        score = score_base * volumen_factor
 
         return {
             "score": float(score),
             "score_base": float(score_base),
             "volumen_factor": float(volumen_factor),
-            "reliability_factor": float(reliability_factor),
-            "low_trade_penalty": float(low_trade_penalty),
+            "reliability_factor": 1.0,
+            "low_trade_penalty": 1.0,
+            "temporal_penalty": 1.0,
+            "monte_carlo_penalty": 1.0,
+            "walk_forward_penalty": 1.0,
         }
-
-
-    def percentile_rank(self, values, value):
-        if not values:
-            return 0.5
-
-        less_count = sum(1 for item in values if item < value)
-        equal_count = sum(1 for item in values if item == value)
-        return float((less_count + 0.5 * equal_count) / len(values))
-
-
-    def finalize_best_candidate(self, last_model_data):
-        eligible_candidates = [
-            candidate
-            for candidate in self.iteration_candidates
-            if candidate["metrics"]["iteracion"] >= self.min_winning_iteration
-        ]
-
-        if not eligible_candidates:
-            if self.iteration_candidates:
-                fallback_candidate = self.iteration_candidates[-1]
-                self.best_model_data = fallback_candidate["model_data"]
-                fallback_metrics = dict(fallback_candidate["metrics"])
-                fallback_metrics["score"] = fallback_metrics.get("preliminary_score", 0.0)
-                fallback_metrics["score_model"] = "preliminary_fallback"
-                fallback_metrics["peor_trade"] = min((item["pips"] for item in fallback_metrics["lista_pips"]), default=0)
-                self.info_score = fallback_metrics
-                del self.info_score["lista_pips"]
-                self.best_score = fallback_metrics["score"]
-            elif self.best_model_data is None:
-                self.best_model_data = last_model_data
-            return
-
-        metric_values = {
-            metric_name: [candidate["metrics"].get(metric_name, 0.0) for candidate in eligible_candidates]
-            for metric_name in self.robust_score_weights
-        }
-
-        best_candidate = None
-        best_robust_score = float("-inf")
-        ranked_candidates = []
-
-        for candidate in eligible_candidates:
-            metrics = candidate["metrics"]
-            score_components = {}
-            for metric_name, weight in self.robust_score_weights.items():
-                percentile = self.percentile_rank(metric_values[metric_name], metrics.get(metric_name, 0.0))
-                score_components[metric_name] = float(percentile * weight)
-
-            robust_score_base = float(sum(score_components.values()))
-            n_ops = metrics.get("cantidad_operaciones", 0)
-            trade_penalty = float(
-                1.0 / (1.0 + np.exp(-(n_ops - self.robust_trade_penalty_center) / self.robust_trade_penalty_scale))
-            )
-            avg_bars = metrics.get("avg_bars_held", 0.0)
-            duration_penalty = 1.0 if avg_bars >= self.robust_min_avg_bars else float(max(0.75, avg_bars / max(self.robust_min_avg_bars, 1.0)))
-            robust_score = robust_score_base * trade_penalty * duration_penalty
-
-            metrics["score_components"] = score_components
-            metrics["score_base"] = robust_score_base
-            metrics["trade_penalty"] = trade_penalty
-            metrics["duration_penalty"] = duration_penalty
-            metrics["score_model"] = "percentile_batch_v1"
-            metrics["score"] = float(robust_score)
-            ranked_candidates.append(candidate)
-
-            if robust_score > best_robust_score:
-                best_robust_score = robust_score
-                best_candidate = candidate
-
-        if best_candidate is None:
-            if self.best_model_data is None:
-                self.best_model_data = last_model_data
-            return
-
-        self.best_score = float(best_robust_score)
-        self.best_model_data = best_candidate["model_data"]
-        best_metrics = dict(best_candidate["metrics"])
-        self.peor_trade = min((item["pips"] for item in best_metrics["lista_pips"]), default=0)
-        best_metrics["peor_trade"] = self.peor_trade
-
-        ranked_candidates.sort(key=lambda item: item["metrics"].get("score", float("-inf")), reverse=True)
-        top_candidates = ranked_candidates[:self.ensemble_top_k]
-        ensemble_weight_sum = 0.0
-        self.ensemble_model_entries = []
-        for rank, candidate in enumerate(top_candidates):
-            candidate_score = max(float(candidate["metrics"].get("score", 0.0)), 0.0) + 1e-6
-            weight = candidate_score * (self.ensemble_decay_factor ** rank)
-            ensemble_weight_sum += weight
-            self.ensemble_model_entries.append({
-                "model_data": candidate["model_data"],
-                "weight": float(weight),
-                "iteration": candidate["metrics"].get("iteracion"),
-                "score": candidate["metrics"].get("score"),
-                "threshold": candidate["metrics"].get("best_threshold", self.close_threshold_floor),
-            })
-
-        if ensemble_weight_sum > 0:
-            for entry in self.ensemble_model_entries:
-                entry["weight"] = float(entry["weight"] / ensemble_weight_sum)
-
-        ensemble_threshold = best_metrics.get("best_threshold", self.close_threshold_floor)
-        if self.ensemble_model_entries:
-            ensemble_threshold = float(sum(entry["weight"] * entry["threshold"] for entry in self.ensemble_model_entries))
-
-        best_metrics["ensemble"] = {
-            "enabled": len(self.ensemble_model_entries) > 1,
-            "top_k": len(self.ensemble_model_entries),
-            "decay_factor": self.ensemble_decay_factor,
-            "threshold": ensemble_threshold,
-            "members": [
-                {
-                    "iteration": entry["iteration"],
-                    "score": entry["score"],
-                    "weight": entry["weight"],
-                }
-                for entry in self.ensemble_model_entries
-            ],
-        }
-        self.info_score = best_metrics
-        self.info_score["best_threshold"] = best_metrics["best_threshold"]
-        del self.info_score["lista_pips"]
-        print(
-            f"Mejor modelo final por percentil batch: iteración {best_metrics['iteracion']} | "
-            f"score={best_metrics['score']:.4f}"
-        )
 
 
     def calculate_score(self, metrics, model_data):
@@ -1617,6 +1385,13 @@ class Backtester:
         if preliminary["score"] > self.best_score:
             self.best_score = preliminary["score"]
             self.no_improve_iterations = 0
+            self.best_model_data = model_data
+            best_metrics = dict(metrics)
+            self.peor_trade = min((item["pips"] for item in best_metrics["lista_pips"]), default=0)
+            best_metrics["peor_trade"] = self.peor_trade
+            self.info_score = best_metrics
+            if "lista_pips" in self.info_score:
+                del self.info_score["lista_pips"]
             print(f"Nueva mejor referencia preliminar: {preliminary['score']:.4f}")
         else:
             self.no_improve_iterations += 1
@@ -1630,9 +1405,17 @@ class Backtester:
     def run(self):
         last_model_data = None
 
-        for i in range(self.max_iterations):
+        total_iterations = self.max_iterations
+        if self.walk_forward_folds:
+            total_iterations = min(self.max_iterations, len(self.walk_forward_folds))
+
+        for i in range(total_iterations):
             print(f"\n--- Iteración {i+1} ---")
             self.index = i + 1
+
+            if self.walk_forward_folds:
+                self.apply_walk_forward_fold(i)
+
             try:
                 model_data = self.train_iteration()
             except ValueError as exc:
@@ -1641,11 +1424,6 @@ class Backtester:
                 self.info_score = {
                     "skipped": True,
                     "skip_reason": str(exc),
-                    "selection_reference": {
-                        "raw_reasons": ["insufficient_training_data"],
-                        "deployment_score": -9999.0,
-                        "thresholds": {},
-                    },
                 }
                 break
             last_model_data = model_data
@@ -1654,7 +1432,6 @@ class Backtester:
 
             if (
                 self.early_stopping_patience > 0
-                and self.index >= self.min_winning_iteration
                 and self.no_improve_iterations >= self.early_stopping_patience
             ):
                 print(
@@ -1663,7 +1440,16 @@ class Backtester:
                 )
                 break
 
-        self.finalize_best_candidate(last_model_data)
+        if self.best_model_data is None and last_model_data is not None:
+            self.best_model_data = last_model_data
+        if not self.info_score and self.iteration_candidates:
+            fallback_metrics = dict(self.iteration_candidates[-1]["metrics"])
+            fallback_metrics["score"] = fallback_metrics.get("preliminary_score", 0.0)
+            fallback_metrics["score_model"] = "simple_preliminary_fallback"
+            fallback_metrics["peor_trade"] = min((item["pips"] for item in fallback_metrics["lista_pips"]), default=0)
+            self.info_score = fallback_metrics
+            if "lista_pips" in self.info_score:
+                del self.info_score["lista_pips"]
 
         if self.best_model_data is None:
             with open(f'output/{self.principal_symbol}/data_for_neuronal/best_score/score_{self.mercado}_{self.algorithm}.json', 'w') as f:
@@ -1675,10 +1461,6 @@ class Backtester:
 
         torch_model_path = f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/model_{self.mercado}_{self.algorithm}.pt'
         torch.save(self.best_model_data, torch_model_path)
-        if self.ensemble_model_entries:
-            ensemble_model_path = f'output/{self.principal_symbol}/data_for_neuronal/model_trainer/ensemble_{self.mercado}_{self.algorithm}.pt'
-            save_ensemble_model(self.ensemble_model_entries, ensemble_model_path)
-            self.info_score.setdefault("ensemble", {})["model_path"] = ensemble_model_path
         with open(f'output/{self.principal_symbol}/data_for_neuronal/best_score/score_{self.mercado}_{self.algorithm}.json', 'w') as f:
             json.dump({
                 "metrics": _sanitize_for_json(self.info_score)

@@ -71,7 +71,7 @@ def max_losing_streak(values):
     return max_streak
 
 
-def calculate_node_quality_stats(pips_values):
+def calculate_node_quality_stats(pips_values, num_conditions=3):
     values = pd.Series(pips_values, dtype='float64').dropna().to_numpy()
     if values.size == 0:
         return None
@@ -87,19 +87,32 @@ def calculate_node_quality_stats(pips_values):
     drawdowns = equity_curve - running_max
     max_drawdown = float(abs(drawdowns.min())) if drawdowns.size else 0.0
     drawdown_ratio = max_drawdown / max(abs(float(values.sum())), 1.0)
-    quality_score = float(
+    num_trades = int(values.size)
+    winrate = float((values > 0).mean()) if num_trades else 0.0
+
+    quality_base = float(
         (expectancy * 1.5) +
         (min(profit_factor, 3.0) * 2.0) +
         (min(sharpe_like, 2.5) * 1.5) -
         (drawdown_ratio * 2.0) -
         (max(max_losing_streak(values) - 3, 0) * 0.25)
+        + (winrate * 0.5)
     )
+
+    # Penaliza edges con poca muestra y nodos excesivamente complejos.
+    trade_weight = float(num_trades / (num_trades + 50.0))
+    complexity_factor = float(1.0 / (1.0 + 0.15 * max(int(num_conditions) - 3, 0)))
+    quality_score = float(quality_base * trade_weight * complexity_factor)
 
     return {
         'expectancy': expectancy,
         'profit_factor': float(profit_factor),
         'sharpe_like': sharpe_like,
         'drawdown_ratio': float(drawdown_ratio),
+        'winrate': winrate,
+        'num_trades': num_trades,
+        'trade_weight': trade_weight,
+        'complexity_factor': complexity_factor,
         'quality_score': quality_score,
     }
 
@@ -335,7 +348,10 @@ def selecte_nodes(file: str, op_down, op_up, symbol, list_nodos, mercado, log_q=
         if (porcentaje_aciertos_os < config['MinSuccessRate'] or 
             porcentaje_aciertos_os > config['MaxSuccessRate']):
             continue
-        stats_os = calculate_node_quality_stats(beneficios_netos_os)
+        stats_os = calculate_node_quality_stats(
+            beneficios_netos_os,
+            num_conditions=nodo.get('num_conditions', len(conditions)),
+        )
         
         progressive_os = total_os / total_filas_os
         
@@ -388,7 +404,10 @@ def selecte_nodes(file: str, op_down, op_up, symbol, list_nodos, mercado, log_q=
         if (porcentaje_aciertos_is < config['MinSuccessRate'] or 
             porcentaje_aciertos_is > config['MaxSuccessRate']):
             continue
-        stats_is = calculate_node_quality_stats(beneficios_netos_is)
+        stats_is = calculate_node_quality_stats(
+            beneficios_netos_is,
+            num_conditions=nodo.get('num_conditions', len(conditions)),
+        )
         if not passes_quality_filters(stats_is, stats_os):
             continue
         
