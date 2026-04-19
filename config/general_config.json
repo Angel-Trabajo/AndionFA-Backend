@@ -57,7 +57,7 @@
     "MaxSuccessRate": 0.55,
     "ProgressiveVariation": 0.05,
     "min_operaciones": 400,
-    "timeframe": "M1",
+    "timeframe": "M30",
     "por_direccion": true,
     "validation_window_fraction": 0.15,
     "walk_forward_enabled": true,

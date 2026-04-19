@@ -476,13 +476,47 @@ def procesar_archivo(file: str, symbol, mercado, log_q=None):
         df = enrich_with_event_features(df, df_bas)
         df_generator = df.iloc[:int(len(df)*0.2)].copy()  # Para no modificar el original
         node_generator = NodeGenerator(df_generator)
+        operaciones = config['NumMaxOperations']
         operaciones_exitosas_UP = 0
         operaciones_exitosas_DOWN = 0
-        while operaciones_exitosas_UP < config['NumMaxOperations'] or operaciones_exitosas_DOWN < config['NumMaxOperations']:
-            list_nodos = node_generator.generar_nodos(100)
+        
+        stagnant_iterations = 0
+        prev_operaciones_exitosas_up = operaciones_exitosas_UP
+        prev_operaciones_exitosas_down = operaciones_exitosas_DOWN
+        
+        while operaciones_exitosas_UP < operaciones or operaciones_exitosas_DOWN < operaciones:
+            
+            list_nodos = node_generator.generar_nodos(300)
             selecte_nodes(file, operaciones_exitosas_DOWN, operaciones_exitosas_UP, symbol, list_nodos, mercado, log_q=log_q)
             operaciones_exitosas_UP = db_query.successful_operations_by_label(principal_symbol=symbol, symbol_cruce=symbol, label='UP', mercado=mercado)
             operaciones_exitosas_DOWN = db_query.successful_operations_by_label(principal_symbol=symbol, symbol_cruce=symbol, label='DOWN', mercado=mercado)
+
+            # Si no hay avance en UP y DOWN durante 30 iteraciones, bajar objetivo en 50.
+            if (
+                operaciones_exitosas_UP == prev_operaciones_exitosas_up
+                and operaciones_exitosas_DOWN == prev_operaciones_exitosas_down
+            ):
+                stagnant_iterations += 1
+            else:
+                stagnant_iterations = 0
+
+            if stagnant_iterations >= 30:
+                nuevo_objetivo = max(0, int(operaciones) - 50)
+                if nuevo_objetivo < operaciones:
+                    msg = (
+                        f"Sin cambios en 30 iteraciones para {symbol}/{mercado}/{file}. "
+                        f"Reduciendo objetivo de operaciones: {operaciones} -> {nuevo_objetivo}"
+                    )
+                    print(msg)
+                    if log_q is not None:
+                        log_q.put(msg)
+                    operaciones = nuevo_objetivo
+                stagnant_iterations = 0
+
+            prev_operaciones_exitosas_up = operaciones_exitosas_UP
+            prev_operaciones_exitosas_down = operaciones_exitosas_DOWN
+            print(f"Progreso {symbol}/{mercado}/{file}: UP {operaciones_exitosas_UP}")
+            print(f"Progreso {symbol}/{mercado}/{file}: DOWN {operaciones_exitosas_DOWN}")
     except Exception:
         logger.exception(
             "Error procesando archivo %s (symbol=%s, mercado=%s)",

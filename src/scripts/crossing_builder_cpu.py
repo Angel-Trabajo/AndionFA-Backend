@@ -585,8 +585,11 @@ def procesar_archivo(file: str, symbol, action, cont, prev_os, prev_is, porcent_
     df = enrich_with_event_features(df, df_bas)
     df_generator = df.iloc[:int(len(df)*0.2)].copy()  # Para no modificar el original
     node_generator = NodeGenerator(df_generator)
+    operaciones = NumMaxOperations
     operaciones_exitosas = 0
-    while (operaciones_exitosas < NumMaxOperations):
+    stagnant_iterations = 0
+    prev_operaciones_exitosas = operaciones_exitosas
+    while (operaciones_exitosas < operaciones):
         
         selecte_nodes(
             file,
@@ -611,6 +614,27 @@ def procesar_archivo(file: str, symbol, action, cont, prev_os, prev_is, porcent_
             
             )
         )
+
+        # Si no hay avance en 30 iteraciones, reducir objetivo en 50.
+        if operaciones_exitosas == prev_operaciones_exitosas:
+            stagnant_iterations += 1
+        else:
+            stagnant_iterations = 0
+
+        if stagnant_iterations >= 30:
+            nuevo_objetivo = max(0, int(operaciones) - 50)
+            if nuevo_objetivo < operaciones:
+                _msg_reduce = (
+                    f"Sin cambios en 30 iteraciones para {symbol}-{action}-{mercado}-{file}. "
+                    f"Reduciendo objetivo de operaciones: {operaciones} -> {nuevo_objetivo}"
+                )
+                print(_msg_reduce)
+                if log_q is not None:
+                    log_q.put(_msg_reduce)
+                operaciones = nuevo_objetivo
+            stagnant_iterations = 0
+
+        prev_operaciones_exitosas = operaciones_exitosas
 
         _msg_ops = (
             f"Operaciones exitosas mercado {mercado} "
