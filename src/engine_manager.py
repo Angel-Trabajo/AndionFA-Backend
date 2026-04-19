@@ -306,34 +306,3 @@ def get_logs(since: int = 0) -> list[str]:
     return logs[since:]
 
 
-# ---------------------------------------------------------------------------
-# Auto-backup (cada 6 horas)
-# ---------------------------------------------------------------------------
-
-_auto_backup_thread: threading.Thread | None = None
-
-
-def _auto_backup_loop() -> None:
-    import time
-    INTERVAL = 6 * 60 * 60  # 6 horas
-    while True:
-        time.sleep(INTERVAL)
-        try:
-            from src.db.backup_db import create_backup
-            file_name = create_backup()
-            print(f"[AutoBackup] Backup creado: {file_name}")
-        except Exception as exc:
-            print(f"[AutoBackup] Error: {exc}")
-
-
-def _start_auto_backup() -> None:
-    global _auto_backup_thread
-    if _auto_backup_thread is None or not _auto_backup_thread.is_alive():
-        _auto_backup_thread = threading.Thread(
-            target=_auto_backup_loop, daemon=True, name="AutoBackup"
-        )
-        _auto_backup_thread.start()
-
-
-def start_background_services() -> None:
-    _start_auto_backup()

@@ -15,7 +15,6 @@ app = FastAPI()
 @app.on_event("startup")
 async def startup_event():
     peticiones.initialize_mt5()
-    engine_manager.start_background_services()
 
 
 
